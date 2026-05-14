@@ -2557,7 +2557,7 @@ no other fields are present per PAT-0300."
             (firefox-to-emacs-native-messenger-test--frame-bytes invalid))
            (sent '()))
       (cl-letf (((symbol-function
-                  'firefox-to-emacs-native-messenger--send-response)
+                  'firefox-to-emacs-native-messenger--write-response)
                  (lambda (conn resp) (push (cons conn resp) sent))))
         (firefox-to-emacs-native-messenger--connection-filter client frame))
       (should (= 1 (length sent)))
@@ -2579,7 +2579,7 @@ no other fields are present per PAT-0300."
            (frame (concat prefix bad-bytes))
            (sent '()))
       (cl-letf (((symbol-function
-                  'firefox-to-emacs-native-messenger--send-response)
+                  'firefox-to-emacs-native-messenger--write-response)
                  (lambda (conn resp) (push (cons conn resp) sent))))
         (firefox-to-emacs-native-messenger--connection-filter client frame))
       (should (= 1 (length sent)))
@@ -2596,7 +2596,7 @@ no other fields are present per PAT-0300."
            (frame
             (firefox-to-emacs-native-messenger-test--frame-bytes invalid)))
       (cl-letf (((symbol-function
-                  'firefox-to-emacs-native-messenger--send-response)
+                  'firefox-to-emacs-native-messenger--write-response)
                  (lambda (&rest _) nil)))
         (firefox-to-emacs-native-messenger--connection-filter client frame))
       (should (equal
@@ -2614,7 +2614,7 @@ no other fields are present per PAT-0300."
            (frame
             (firefox-to-emacs-native-messenger-test--frame-bytes invalid)))
       (cl-letf (((symbol-function
-                  'firefox-to-emacs-native-messenger--send-response)
+                  'firefox-to-emacs-native-messenger--write-response)
                  (lambda (&rest _) nil)))
         (firefox-to-emacs-native-messenger--connection-filter client frame))
       (should-not
@@ -2635,7 +2635,7 @@ no other fields are present per PAT-0300."
                   'firefox-to-emacs-native-messenger--dispatch-request)
                  (lambda (&rest _) (cl-incf dispatch-calls)))
                 ((symbol-function
-                  'firefox-to-emacs-native-messenger--send-response)
+                  'firefox-to-emacs-native-messenger--write-response)
                  (lambda (&rest _) nil)))
         (firefox-to-emacs-native-messenger--connection-filter client frame))
       (should (= 0 dispatch-calls)))))
@@ -2814,6 +2814,1017 @@ must identify the close as occurring after the response was sent."
           (save-excursion
             (goto-char (point-min))
             (re-search-forward "after response" nil t))))))))
+
+
+;;;; Phase 0600 -- response builder, serializer, writer, cleanup timer
+
+(ert-deftest firefox-to-emacs-native-messenger-test-build-response-no-absent-passes-through ()
+  "A response with no `:absent' fields is returned with all fields preserved.
+
+The structural null-stripping rule (PROTOCOL.md S6) strips only fields
+whose value is the sentinel `:absent'; every other value, including
+strings, numbers, and the empty string, MUST be preserved verbatim."
+  :tags '(:unit :fixture-driven)
+  (let* ((input '((cmd . "version") (version . "0.3.7") (code . 0)))
+         (built (firefox-to-emacs-native-messenger--build-response input)))
+    (should (equal built input))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-build-response-version-success-shape ()
+  "Builder output for a `version' handler-style input matches the fixture.
+
+The `version-success' fixture's response shape contains no absent
+fields; the builder passes the handler-style input through unchanged."
+  :tags '(:unit :fixture-driven)
+  (let* ((handler-output '((cmd . "version") (version . "0.3.7") (code . 0)))
+         (built (firefox-to-emacs-native-messenger--build-response handler-output))
+         (fixture (firefox-to-emacs-native-messenger-test-load-fixture
+                   "version-success"))
+         (expected-response (alist-get 'response fixture)))
+    (should (equal built expected-response))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-build-response-strips-absent-fields ()
+  "Fields whose value is the keyword `:absent' MUST be stripped.
+
+Per PROTOCOL.md S6, structural absence is preserved on the wire; the
+sentinel `:absent' is the in-process marker telling the builder to omit
+the field."
+  :tags '(:unit)
+  (let* ((input '((cmd . "getconfigpath") (content . :absent) (code . 1)))
+         (built (firefox-to-emacs-native-messenger--build-response input)))
+    (should (equal built '((cmd . "getconfigpath") (code . 1))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-build-response-getconfigpath-empty-shape ()
+  "Builder strips the absent content field to match `getconfigpath-empty'.
+
+The handler-style input for the empty-result branch uses `:absent' for
+the content field; the builder's output MUST equal the fixture's
+response shape (which has no content key)."
+  :tags '(:unit :fixture-driven)
+  (let* ((handler-output '((cmd . "getconfigpath") (content . :absent) (code . 1)))
+         (built (firefox-to-emacs-native-messenger--build-response handler-output))
+         (fixture (firefox-to-emacs-native-messenger-test-load-fixture
+                   "getconfigpath-empty"))
+         (expected-response (alist-get 'response fixture)))
+    (should (equal built expected-response))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-build-response-preserves-empty-string ()
+  "An explicit empty-string value MUST be preserved (not stripped).
+
+The `read' open-failure response has `content' set to the empty string
+(distinct from absence): PROTOCOL.md S5 and S6.  Stripping the empty
+string would conflate two distinct wire shapes."
+  :tags '(:unit :fixture-driven)
+  (let* ((input '((cmd . "read") (content . "") (code . 2)))
+         (built (firefox-to-emacs-native-messenger--build-response input))
+         (fixture (firefox-to-emacs-native-messenger-test-load-fixture
+                   "read-open-failure"))
+         (expected-response (alist-get 'response fixture)))
+    (should (equal built input))
+    (should (equal built expected-response))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-build-response-preserves-zero ()
+  "An explicit zero value MUST be preserved (not stripped).
+
+Per PROTOCOL.md S6, integers including zero are preserved verbatim;
+stripping zero would lose semantic information (e.g., success code)."
+  :tags '(:unit)
+  (let* ((input '((cmd . "version") (version . "0.0.0") (code . 0)))
+         (built (firefox-to-emacs-native-messenger--build-response input)))
+    (should (equal built input))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-build-response-preserves-false ()
+  "An explicit `:false' value MUST be preserved (not stripped).
+
+Per PROTOCOL.md S6, boolean false (represented as `:false' to match the
+parser's :false-object) is preserved.  No in-scope handler currently
+uses boolean fields, but the structural rule applies uniformly."
+  :tags '(:unit)
+  (let* ((input '((cmd . "x") (flag . :false)))
+         (built (firefox-to-emacs-native-messenger--build-response input)))
+    (should (equal built input))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-build-response-multiple-absent ()
+  "Multiple `:absent' fields are all stripped in one pass."
+  :tags '(:unit)
+  (let* ((input '((cmd . "x") (a . :absent) (b . 1) (c . :absent) (d . 2)))
+         (built (firefox-to-emacs-native-messenger--build-response input)))
+    (should (equal built '((cmd . "x") (b . 1) (d . 2))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-build-response-preserves-insertion-order ()
+  "The builder preserves cmd-first insertion order across stripping."
+  :tags '(:unit)
+  (let* ((input '((cmd . "x") (a . :absent) (b . 1) (c . :absent) (d . 2)))
+         (built (firefox-to-emacs-native-messenger--build-response input)))
+    (should (eq 'cmd (caar built)))
+    (should (equal '(cmd b d) (mapcar #'car built)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-build-response-output-is-json-serializable ()
+  "Build output passes through `json-serialize' to produce valid JSON.
+
+The builder's contract is that its output is JSON-serializable by the
+response serializer; this test validates the contract empirically by
+serializing then re-parsing and asserting structural identity."
+  :tags '(:unit)
+  (let* ((input '((cmd . "version") (version . "0.3.7") (code . 0)))
+         (built (firefox-to-emacs-native-messenger--build-response input))
+         (json (json-serialize built :null-object :null :false-object :false))
+         (round-tripped (json-parse-string
+                         json :object-type 'alist :null-object nil
+                         :false-object :false)))
+    (should (equal round-tripped input))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-build-response-empty-alist ()
+  "An empty input alist is returned unchanged.
+
+The empty alist is a degenerate case (no handler should return it);
+the builder accepts it as-is rather than signaling, leaving safety to
+the writer's downstream checks."
+  :tags '(:unit)
+  (should (equal nil (firefox-to-emacs-native-messenger--build-response nil)))
+  (should (equal '() (firefox-to-emacs-native-messenger--build-response '()))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-build-response-no-side-effects ()
+  "The builder MUST NOT mutate its input alist.
+
+Re-running the builder on the same input MUST yield equal results;
+the input alist MUST be unchanged after the call (no destructive
+modification of cons cells)."
+  :tags '(:unit)
+  (let* ((input (copy-tree '((cmd . "x") (a . :absent) (b . 1))))
+         (snapshot (copy-tree input))
+         (built1 (firefox-to-emacs-native-messenger--build-response input))
+         (built2 (firefox-to-emacs-native-messenger--build-response input)))
+    (should (equal input snapshot))
+    (should (equal built1 built2))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-serialize-response-ascii ()
+  "Serializer produces a 4-byte little-endian prefix plus UTF-8 JSON payload.
+
+For an ASCII response, the byte length and character length coincide;
+the prefix is the JSON byte length packed little-endian, and the
+output unibyte string is exactly prefix+payload."
+  :tags '(:unit)
+  (let* ((input '((cmd . "version") (version . "0.3.7") (code . 0)))
+         (framed (firefox-to-emacs-native-messenger--serialize-response input))
+         (declared (firefox-to-emacs-native-messenger--unpack-length
+                    (substring framed 0 4)))
+         (payload (substring framed 4))
+         (json (json-serialize input
+                               :null-object :null
+                               :false-object :false)))
+    (should-not (multibyte-string-p framed))
+    (should (= declared (length payload)))
+    (should (= declared (string-bytes json)))
+    (should (equal (decode-coding-string payload 'utf-8) json))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-serialize-response-multibyte ()
+  "Serializer's length prefix reflects UTF-8 byte length, not character count.
+
+A response carrying non-ASCII characters serializes to a JSON string
+whose UTF-8 byte representation has more bytes than characters; the
+prefix MUST be the byte length, not the character count.  Using `length'
+on the original multibyte JSON would understate the byte count and
+produce a too-small length prefix."
+  :tags '(:unit)
+  (let* ((input '((cmd . "read") (content . "héllo") (code . 0)))
+         (expected-json "{\"cmd\":\"read\",\"content\":\"héllo\",\"code\":0}")
+         (framed (firefox-to-emacs-native-messenger--serialize-response input))
+         (declared (firefox-to-emacs-native-messenger--unpack-length
+                    (substring framed 0 4)))
+         (payload (substring framed 4))
+         (json (json-serialize input
+                               :null-object :null
+                               :false-object :false)))
+    (should-not (multibyte-string-p framed))
+    (should (= declared (length payload)))
+    (should (= declared (string-bytes json)))
+    (should (= declared (string-bytes expected-json)))
+    (should (> (string-bytes expected-json) (length expected-json)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-serialize-response-little-endian-prefix ()
+  "The 4-byte length prefix is little-endian (low byte first).
+
+Each of the four prefix bytes is asserted to equal the corresponding
+8-bit slice of the payload length, lowest-order byte first."
+  :tags '(:unit)
+  (let* ((padding (make-string 233 ?x))
+         (input (list (cons 'cmd "x") (cons 'data padding)))
+         (framed (firefox-to-emacs-native-messenger--serialize-response input))
+         (payload-len (length (substring framed 4))))
+    (should (= (aref framed 0) (logand payload-len #xff)))
+    (should (= (aref framed 1) (logand (ash payload-len -8) #xff)))
+    (should (= (aref framed 2) (logand (ash payload-len -16) #xff)))
+    (should (= (aref framed 3) (logand (ash payload-len -24) #xff)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-serialize-response-roundtrip ()
+  "Framed payload, when unpacked and JSON-parsed, yields the original alist.
+
+The full pipeline (serialize -> unpack length -> decode UTF-8 -> parse
+JSON) is exercised end-to-end on a representative response."
+  :tags '(:unit :fixture-driven)
+  (let* ((input '((cmd . "version") (version . "0.3.7") (code . 0)))
+         (framed (firefox-to-emacs-native-messenger--serialize-response input))
+         (declared (firefox-to-emacs-native-messenger--unpack-length
+                    (substring framed 0 4)))
+         (payload (substring framed 4 (+ 4 declared)))
+         (parsed (json-parse-string
+                  (decode-coding-string payload 'utf-8)
+                  :object-type 'alist
+                  :null-object nil
+                  :false-object :false)))
+    (should (equal parsed input))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-serialize-response-preserves-false ()
+  "An explicit `:false' value serializes as JSON `false' and round-trips back.
+
+The :false-object marker matches the parser's configuration, so the
+roundtrip preserves `:false' verbatim."
+  :tags '(:unit)
+  (let* ((input '((cmd . "x") (flag . :false)))
+         (framed (firefox-to-emacs-native-messenger--serialize-response input))
+         (declared (firefox-to-emacs-native-messenger--unpack-length
+                    (substring framed 0 4)))
+         (payload (substring framed 4 (+ 4 declared)))
+         (json (decode-coding-string payload 'utf-8))
+         (parsed (json-parse-string json
+                                    :object-type 'alist
+                                    :null-object nil
+                                    :false-object :false)))
+    (should (string-match-p "\"flag\":false" json))
+    (should (equal parsed input))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-serialize-response-version-success-fixture ()
+  "Framed payload's decoded JSON parses to the `version-success' fixture response.
+
+End-to-end: the handler-shaped input, serialized and round-tripped,
+MUST equal the `version-success' fixture's `response' sub-alist."
+  :tags '(:unit :fixture-driven)
+  (let* ((input '((cmd . "version") (version . "0.3.7") (code . 0)))
+         (framed (firefox-to-emacs-native-messenger--serialize-response input))
+         (declared (firefox-to-emacs-native-messenger--unpack-length
+                    (substring framed 0 4)))
+         (payload (substring framed 4 (+ 4 declared)))
+         (parsed (json-parse-string
+                  (decode-coding-string payload 'utf-8)
+                  :object-type 'alist
+                  :null-object nil
+                  :false-object :false))
+         (fixture (firefox-to-emacs-native-messenger-test-load-fixture
+                   "version-success"))
+         (expected (alist-get 'response fixture)))
+    (should (equal parsed expected))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-serialize-response-prefix-length-accurate ()
+  "The 4-byte prefix is exactly the byte length of the JSON payload.
+
+Verifies that the prefix can be used to slice the framed payload
+into prefix and JSON body with no leftover bytes."
+  :tags '(:unit)
+  (let* ((input '((cmd . "x") (data . "abc")))
+         (framed (firefox-to-emacs-native-messenger--serialize-response input))
+         (declared (firefox-to-emacs-native-messenger--unpack-length
+                    (substring framed 0 4))))
+    (should (= (length framed) (+ 4 declared)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-serialize-response-unibyte-output ()
+  "The serializer's output is a unibyte string, ready for `process-send-string'.
+
+A multibyte string would be problematic for accurate byte-length
+arithmetic and for transmission over a binary channel."
+  :tags '(:unit)
+  (let* ((input '((cmd . "read") (content . "héllo")))
+         (framed (firefox-to-emacs-native-messenger--serialize-response input)))
+    (should (stringp framed))
+    (should-not (multibyte-string-p framed))))
+
+(defmacro firefox-to-emacs-native-messenger-test--with-paired-clients
+    (server-var test-var &rest body)
+  "Listener + test-side client setup exposing both sides for writer tests.
+
+SERVER-VAR is bound to the listener-side accepted client process
+extracted from the connection registry.  TEST-VAR is bound to the
+test-side client process; its filter accumulates received bytes into
+the test-side process's `received' plist key (read it via
+(process-get TEST-VAR 'received)).
+
+BODY can call the response writer on SERVER-VAR and drain I/O via
+`accept-process-output' to observe the bytes that propagate to the
+test side."
+  (declare (indent 2) (debug (symbolp symbolp body)))
+  (let ((cache-sym (gensym "fenm-test-cache-"))
+        (tmp-sym (gensym "fenm-test-tmp-"))
+        (sock-sym (gensym "fenm-test-sock-")))
+    `(firefox-to-emacs-native-messenger-test--with-listener-sandbox
+         ,cache-sym ,tmp-sym ,sock-sym
+       (firefox-to-emacs-native-messenger-test--with-fresh-connection-registry
+        (firefox-to-emacs-native-messenger-start)
+        (let ((,test-var
+               (make-network-process
+                :name "fenm-test-paired-client"
+                :family 'local
+                :service ,sock-sym
+                :coding '(binary . binary)
+                :noquery t
+                :filter (lambda (proc str)
+                          (process-put
+                           proc 'received
+                           (concat (or (process-get proc 'received) "")
+                                   str))))))
+          (unwind-protect
+              (progn
+                (accept-process-output nil 0.2)
+                (let ((,server-var
+                       (car
+                        (firefox-to-emacs-native-messenger--connection-registry-list))))
+                  ,@body))
+            (when (process-live-p ,test-var)
+              (delete-process ,test-var))))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-write-response-state-responded-noop ()
+  "Writer is a no-op when state is `responded' (pre-send guard).
+
+Per PAT-0600 / Section 8.18, the writer's pre-send guard refuses to
+write when the connection has already transitioned past the
+`reading'/`dispatched' allowlist.  No bytes go on the wire."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-paired-clients server tc
+    (should server)
+    (process-put
+     server
+     firefox-to-emacs-native-messenger--connection-key-state
+     'responded)
+    (firefox-to-emacs-native-messenger--write-response
+     server '((cmd . "version") (version . "0.3.7") (code . 0)))
+    (accept-process-output nil 0.1)
+    (should-not (process-get tc 'received))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-write-response-state-closing-noop ()
+  "Writer is a no-op when state is `closing' (pre-send guard)."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-paired-clients server tc
+    (should server)
+    (process-put
+     server
+     firefox-to-emacs-native-messenger--connection-key-state
+     'closing)
+    (firefox-to-emacs-native-messenger--write-response
+     server '((cmd . "version") (version . "0.3.7") (code . 0)))
+    (accept-process-output nil 0.1)
+    (should-not (process-get tc 'received))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-write-response-dead-process-noop ()
+  "Writer is a no-op (no error) when CLIENT is no longer live."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-paired-clients server _tc
+    (should server)
+    (delete-process server)
+    (firefox-to-emacs-native-messenger--write-response
+     server '((cmd . "version") (version . "0.3.7") (code . 0)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-write-response-reading-state-sends-frame ()
+  "Writer sends a framed response when state is `reading'.
+
+The test-side client's filter accumulates the bytes; the bytes are
+length-prefixed UTF-8 JSON that round-trips to the input response."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-paired-clients server tc
+    (should server)
+    (firefox-to-emacs-native-messenger--write-response
+     server '((cmd . "version") (version . "0.3.7") (code . 0)))
+    (accept-process-output nil 0.2)
+    (let* ((received (process-get tc 'received))
+           (declared (firefox-to-emacs-native-messenger--unpack-length
+                      (substring received 0 4)))
+           (payload (substring received 4 (+ 4 declared)))
+           (parsed (json-parse-string
+                    (decode-coding-string payload 'utf-8)
+                    :object-type 'alist
+                    :null-object nil
+                    :false-object :false)))
+      (should (= 4 (- (length received) declared)))
+      (should (equal parsed
+                     '((cmd . "version") (version . "0.3.7") (code . 0)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-write-response-dispatched-state-sends-frame ()
+  "Writer sends a framed response when state is `dispatched'.
+
+The `dispatched' state is reserved for async handlers that defer the
+response (Phase 0800); the writer MUST accept this state."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-paired-clients server tc
+    (should server)
+    (process-put
+     server
+     firefox-to-emacs-native-messenger--connection-key-state
+     'dispatched)
+    (firefox-to-emacs-native-messenger--write-response
+     server '((cmd . "version") (version . "0.3.7") (code . 0)))
+    (accept-process-output nil 0.2)
+    (let* ((received (process-get tc 'received))
+           (declared (firefox-to-emacs-native-messenger--unpack-length
+                      (substring received 0 4)))
+           (payload (substring received 4 (+ 4 declared)))
+           (parsed (json-parse-string
+                    (decode-coding-string payload 'utf-8)
+                    :object-type 'alist
+                    :null-object nil
+                    :false-object :false)))
+      (should (equal parsed
+                     '((cmd . "version") (version . "0.3.7") (code . 0)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-write-response-transitions-state-to-responded ()
+  "After a successful send the connection state is `responded'."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-paired-clients server _tc
+    (should server)
+    (firefox-to-emacs-native-messenger--write-response
+     server '((cmd . "version") (version . "0.3.7") (code . 0)))
+    (should (eq 'responded
+                (process-get
+                 server
+                 firefox-to-emacs-native-messenger--connection-key-state)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-write-response-marks-responded-before-send ()
+  "State transitions to `responded' BEFORE `process-send-string' runs.
+
+The pre-send mark is observable from inside an instrumented
+`process-send-string' replacement: at the moment the send is invoked,
+the connection state MUST already be `responded'."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-paired-clients server _tc
+    (should server)
+    (let ((observed nil)
+          (orig (symbol-function 'process-send-string)))
+      (cl-letf (((symbol-function 'process-send-string)
+                 (lambda (proc str)
+                   (when (eq proc server)
+                     (setq observed
+                           (process-get
+                            proc
+                            firefox-to-emacs-native-messenger--connection-key-state)))
+                   (funcall orig proc str))))
+        (firefox-to-emacs-native-messenger--write-response
+         server '((cmd . "x"))))
+      (should (eq observed 'responded)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-write-response-starts-cleanup-timer ()
+  "After a successful send the cleanup-timer plist key holds a live timer."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-paired-clients server _tc
+    (should server)
+    (firefox-to-emacs-native-messenger--write-response
+     server '((cmd . "version") (version . "0.3.7") (code . 0)))
+    (let ((timer (process-get
+                  server
+                  firefox-to-emacs-native-messenger--connection-key-cleanup-timer)))
+      (should (timerp timer))
+      (should (member timer timer-list)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-write-response-oversized-replaced-with-error ()
+  "An oversized response is replaced exactly once with the `response too large' error.
+
+With the outbound cap reduced to a small value, the response's
+serialized payload exceeds the cap; the writer MUST send the generic
+oversized-response error fixture instead."
+  :tags '(:integration :sandbox :fixture-driven)
+  (firefox-to-emacs-native-messenger-test--with-paired-clients server tc
+    (should server)
+    (let ((firefox-to-emacs-native-messenger-outbound-response-cap 50))
+      (firefox-to-emacs-native-messenger--write-response
+       server
+       (list (cons 'cmd "version")
+             (cons 'version "0.3.7")
+             (cons 'code 0)
+             (cons 'padding (make-string 500 ?x))))
+      (accept-process-output nil 0.2)
+      (let* ((received (process-get tc 'received))
+             (declared (firefox-to-emacs-native-messenger--unpack-length
+                        (substring received 0 4)))
+             (payload (substring received 4 (+ 4 declared)))
+             (parsed (json-parse-string
+                      (decode-coding-string payload 'utf-8)
+                      :object-type 'alist
+                      :null-object nil
+                      :false-object :false)))
+        (should (equal "error" (alist-get 'cmd parsed)))
+        (should (equal "response too large" (alist-get 'error parsed)))
+        (should-not (alist-get 'code parsed))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-write-response-degenerate-sends-no-frame ()
+  "When the replacement error response also exceeds the cap, no frame is sent.
+
+Configure an absurdly small cap (e.g., 5 bytes) so even
+`{\"cmd\":\"error\",\"error\":\"response too large\"}' overflows.  The
+writer MUST log a critical message, mark state `responded', start the
+cleanup timer, and send NO bytes."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-paired-clients server tc
+    (should server)
+    (let ((firefox-to-emacs-native-messenger-outbound-response-cap 5))
+      (firefox-to-emacs-native-messenger--write-response
+       server
+       '((cmd . "version") (version . "0.3.7") (code . 0)))
+      (accept-process-output nil 0.2)
+      (should-not (process-get tc 'received))
+      (should (eq 'responded
+                  (process-get
+                   server
+                   firefox-to-emacs-native-messenger--connection-key-state)))
+      (should (timerp
+               (process-get
+                server
+                firefox-to-emacs-native-messenger--connection-key-cleanup-timer))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-write-response-degenerate-logs-critical ()
+  "The degenerate-fallback path emits a critical (error-level) log entry."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-fresh-log-buffer
+   (firefox-to-emacs-native-messenger-test--with-paired-clients server _tc
+     (should server)
+     (let ((firefox-to-emacs-native-messenger-outbound-response-cap 5))
+       (firefox-to-emacs-native-messenger--write-response
+        server
+        '((cmd . "version") (version . "0.3.7") (code . 0)))
+       (accept-process-output nil 0.1)
+       (let ((buf (get-buffer
+                   firefox-to-emacs-native-messenger-log-buffer-name)))
+         (should buf)
+         (with-current-buffer buf
+           (should
+            (save-excursion
+              (goto-char (point-min))
+              (re-search-forward "ERROR" nil t)))))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-write-response-send-error-still-marks-responded ()
+  "Even when `process-send-string' raises, state is `responded' and timer is scheduled.
+
+The mark-responded-before-send invariant plus the unwind-protect
+cleanup-timer scheduling are both observable in the error path."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-paired-clients server _tc
+    (should server)
+    (let ((debug-on-error nil))
+      (cl-letf (((symbol-function 'process-send-string)
+                 (lambda (&rest _) (error "synthetic-send-failure"))))
+        (firefox-to-emacs-native-messenger--write-response
+         server '((cmd . "x")))))
+    (should (eq 'responded
+                (process-get
+                 server
+                 firefox-to-emacs-native-messenger--connection-key-state)))
+    (should (timerp
+             (process-get
+              server
+              firefox-to-emacs-native-messenger--connection-key-cleanup-timer)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-cleanup-timer-expire-deletes-live-connection ()
+  "Expiration on a live connection deletes the process.
+
+Per Section 8.22, cleanup-timer expiration transitions state from
+`responded' to `closing' and tears down the connection (process
+deletion plus registry removal)."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-paired-clients server _tc
+    (should server)
+    (should (process-live-p server))
+    (firefox-to-emacs-native-messenger--cleanup-timer-expire server)
+    (should-not (process-live-p server))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-cleanup-timer-expire-sets-state-closing ()
+  "Expiration on a live connection transitions state to `closing'."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-paired-clients server _tc
+    (should server)
+    (firefox-to-emacs-native-messenger--cleanup-timer-expire server)
+    (should (eq 'closing
+                (process-get
+                 server
+                 firefox-to-emacs-native-messenger--connection-key-state)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-cleanup-timer-expire-removes-from-registry ()
+  "Expiration removes the connection from the connection registry."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-paired-clients server _tc
+    (should server)
+    (should (gethash server
+                     firefox-to-emacs-native-messenger--connection-registry))
+    (firefox-to-emacs-native-messenger--cleanup-timer-expire server)
+    (should-not (gethash server
+                         firefox-to-emacs-native-messenger--connection-registry))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-cleanup-timer-expire-clears-plist-key ()
+  "Expiration clears the cleanup-timer plist key.
+
+Even if the timer was the one that fired, the plist key is cleared to
+signal that no cleanup timer is currently scheduled."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-paired-clients server _tc
+    (should server)
+    (firefox-to-emacs-native-messenger--start-cleanup-timer server)
+    (firefox-to-emacs-native-messenger--cleanup-timer-expire server)
+    (should-not
+     (process-get
+      server
+      firefox-to-emacs-native-messenger--connection-key-cleanup-timer))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-cleanup-timer-expire-on-deleted-noop ()
+  "Expiration on an already-deleted connection is a silent no-op.
+
+The handler MUST NOT raise when called on a process that was already
+deleted (the sentinel won the race and torn down the connection
+first)."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-paired-clients server _tc
+    (should server)
+    (delete-process server)
+    (should-not (process-live-p server))
+    (firefox-to-emacs-native-messenger--cleanup-timer-expire server)))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-cancel-cleanup-timer-removes-from-timer-list ()
+  "Cancel removes the scheduled timer from `timer-list' and clears the plist key."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-paired-clients server _tc
+    (should server)
+    (let ((timer
+           (firefox-to-emacs-native-messenger--start-cleanup-timer server)))
+      (should (timerp timer))
+      (should (member timer timer-list))
+      (firefox-to-emacs-native-messenger--cancel-cleanup-timer server)
+      (should-not (member timer timer-list))
+      (should-not
+       (process-get
+        server
+        firefox-to-emacs-native-messenger--connection-key-cleanup-timer)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-cancel-cleanup-timer-noop-when-absent ()
+  "Cancel is a silent no-op when no cleanup timer is set."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-paired-clients server _tc
+    (should server)
+    (should-not
+     (process-get
+      server
+      firefox-to-emacs-native-messenger--connection-key-cleanup-timer))
+    (firefox-to-emacs-native-messenger--cancel-cleanup-timer server)
+    (should-not
+     (process-get
+      server
+      firefox-to-emacs-native-messenger--connection-key-cleanup-timer))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-cancel-cleanup-timer-double-cancel-silent ()
+  "Two consecutive cancels are silent and idempotent."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-paired-clients server _tc
+    (should server)
+    (firefox-to-emacs-native-messenger--start-cleanup-timer server)
+    (firefox-to-emacs-native-messenger--cancel-cleanup-timer server)
+    (firefox-to-emacs-native-messenger--cancel-cleanup-timer server)
+    (should-not
+     (process-get
+      server
+      firefox-to-emacs-native-messenger--connection-key-cleanup-timer))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-start-cleanup-timer-cancels-prior ()
+  "Re-starting cancels any prior cleanup timer (idempotent registration)."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-paired-clients server _tc
+    (should server)
+    (let ((t1 (firefox-to-emacs-native-messenger--start-cleanup-timer server)))
+      (let ((t2 (firefox-to-emacs-native-messenger--start-cleanup-timer server)))
+        (should (timerp t1))
+        (should (timerp t2))
+        (should-not (eq t1 t2))
+        (should-not (member t1 timer-list))
+        (should (member t2 timer-list))
+        (should (eq t2
+                    (process-get
+                     server
+                     firefox-to-emacs-native-messenger--connection-key-cleanup-timer)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-sentinel-cancels-cleanup-timer-on-peer-close ()
+  "Per-connection sentinel cancels the cleanup timer on peer-close.
+
+Required by PAT-0600 / Section 8.18 step 5: peer-close arrives via the
+sentinel, which MUST cancel the cleanup timer to avoid an orphan timer
+trying to tear down an already-deleted connection."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-paired-clients server _tc
+    (should server)
+    (firefox-to-emacs-native-messenger--start-cleanup-timer server)
+    (let ((timer
+           (process-get
+            server
+            firefox-to-emacs-native-messenger--connection-key-cleanup-timer)))
+      (should (timerp timer))
+      (firefox-to-emacs-native-messenger--connection-sentinel
+       server "connection broken by remote peer\n")
+      (should-not (member timer timer-list))
+      (should-not
+       (process-get
+        server
+        firefox-to-emacs-native-messenger--connection-key-cleanup-timer)))))
+
+(defun firefox-to-emacs-native-messenger-test--build-request-frame (request-alist)
+  "Build a length-prefixed request frame from REQUEST-ALIST.
+
+Returns a unibyte string suitable for feeding to the per-connection
+filter (`firefox-to-emacs-native-messenger--connection-filter')."
+  (let* ((json (json-serialize request-alist
+                               :null-object :null
+                               :false-object :false))
+         (unibyte (if (multibyte-string-p json)
+                      (encode-coding-string json 'utf-8)
+                    json))
+         (prefix (firefox-to-emacs-native-messenger--pack-length
+                  (length unibyte))))
+    (concat prefix unibyte)))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-dispatcher-wiring-calls-writer-once ()
+  "Synchronous dispatch produces exactly one writer call per request.
+
+Instruments `--write-response' with a counter; sends a framed request
+that hits a stub handler; asserts the counter is exactly 1."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-paired-clients server _tc
+    (should server)
+    (let ((calls 0)
+          (orig (symbol-function
+                 'firefox-to-emacs-native-messenger--write-response))
+          (firefox-to-emacs-native-messenger--handlers
+           (let ((h (make-hash-table :test 'equal)))
+             (puthash "wiring-test"
+                      (lambda (_c _r)
+                        '((cmd . "wiring-test-response") (code . 0)))
+                      h)
+             h)))
+      (cl-letf (((symbol-function
+                  'firefox-to-emacs-native-messenger--write-response)
+                 (lambda (c r) (cl-incf calls) (funcall orig c r))))
+        (let ((frame (firefox-to-emacs-native-messenger-test--build-request-frame
+                      '((cmd . "wiring-test")))))
+          (firefox-to-emacs-native-messenger--connection-filter server frame)
+          (accept-process-output nil 0.2)
+          (should (= 1 calls)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-dispatcher-wiring-parse-error-routes-through-writer ()
+  "The filter's parse-error path emits a generic error frame on the wire.
+
+A malformed JSON payload in a well-framed envelope must produce a
+`{cmd:\"error\", error:...}' response on the wire (not the void
+stub-send-response from earlier phases)."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-paired-clients server tc
+    (should server)
+    (let* ((bad-payload "not valid json")
+           (bad-frame
+            (concat (firefox-to-emacs-native-messenger--pack-length
+                     (length bad-payload))
+                    bad-payload)))
+      (firefox-to-emacs-native-messenger--connection-filter server bad-frame)
+      (accept-process-output nil 0.3)
+      (let* ((received (process-get tc 'received))
+             (declared (firefox-to-emacs-native-messenger--unpack-length
+                        (substring received 0 4)))
+             (payload (substring received 4 (+ 4 declared)))
+             (parsed (json-parse-string
+                      (decode-coding-string payload 'utf-8)
+                      :object-type 'alist
+                      :null-object nil
+                      :false-object :false)))
+        (should (equal "error" (alist-get 'cmd parsed)))
+        (should (stringp (alist-get 'error parsed)))
+        (should (> (length (alist-get 'error parsed)) 0))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-dispatcher-wiring-unknown-cmd-routes-through-writer ()
+  "An unknown cmd produces the `Unhandled message' frame on the wire."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-paired-clients server tc
+    (should server)
+    (let ((firefox-to-emacs-native-messenger--handlers
+           (make-hash-table :test 'equal))
+          (frame (firefox-to-emacs-native-messenger-test--build-request-frame
+                  '((cmd . "no-such-cmd")))))
+      (firefox-to-emacs-native-messenger--connection-filter server frame)
+      (accept-process-output nil 0.3)
+      (let* ((received (process-get tc 'received))
+             (declared (firefox-to-emacs-native-messenger--unpack-length
+                        (substring received 0 4)))
+             (payload (substring received 4 (+ 4 declared)))
+             (parsed (json-parse-string
+                      (decode-coding-string payload 'utf-8)
+                      :object-type 'alist
+                      :null-object nil
+                      :false-object :false)))
+        (should (equal "error" (alist-get 'cmd parsed)))
+        (should (equal "Unhandled message" (alist-get 'error parsed)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-dispatcher-wiring-handler-response-on-wire ()
+  "A stub handler's response round-trips on the wire end-to-end.
+
+The handler returns a known response; the writer serializes and sends
+it; the test-side client receives and parses it.  The parsed JSON MUST
+equal the handler's response object structurally."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-paired-clients server tc
+    (should server)
+    (let ((firefox-to-emacs-native-messenger--handlers
+           (let ((h (make-hash-table :test 'equal)))
+             (puthash "ping"
+                      (lambda (_c _r) '((cmd . "pong") (code . 0)))
+                      h)
+             h)))
+      (let ((frame (firefox-to-emacs-native-messenger-test--build-request-frame
+                    '((cmd . "ping")))))
+        (firefox-to-emacs-native-messenger--connection-filter server frame)
+        (accept-process-output nil 0.3)
+        (let* ((received (process-get tc 'received))
+               (declared (firefox-to-emacs-native-messenger--unpack-length
+                          (substring received 0 4)))
+               (payload (substring received 4 (+ 4 declared)))
+               (parsed (json-parse-string
+                        (decode-coding-string payload 'utf-8)
+                        :object-type 'alist
+                        :null-object nil
+                        :false-object :false)))
+          (should (equal parsed '((cmd . "pong") (code . 0)))))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-dispatcher-wiring-wire-roundtrip-via-send-frame ()
+  "Full wire round-trip via the framed-request sender returns the expected response.
+
+This exercises the listener accept handler, the filter, the dispatcher,
+and the writer end-to-end through a real client connecting from
+outside the test process."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-listener-sandbox
+      _cache _tmp sock
+    (firefox-to-emacs-native-messenger-test--with-fresh-connection-registry
+     (let ((firefox-to-emacs-native-messenger--handlers
+            (let ((h (make-hash-table :test 'equal)))
+              (puthash "ping"
+                       (lambda (_c _r) '((cmd . "pong") (code . 0)))
+                       h)
+              h)))
+       (firefox-to-emacs-native-messenger-start)
+       (let ((response (firefox-to-emacs-native-messenger-test-send-frame
+                        sock '((cmd . "ping")))))
+         (should (equal response '((cmd . "pong") (code . 0)))))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-dispatcher-wiring-deferred-handler-skips-writer ()
+  "When a handler sets state to `dispatched', the dispatcher does NOT call the writer.
+
+This documents the deferred-response semantics that Phase 0800's run
+handler relies on: an async handler signals deferral by transitioning
+the connection state to `dispatched' before returning; the dispatcher
+MUST then leave the wire write to the handler's subsequent callback."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-paired-clients server tc
+    (should server)
+    (let ((calls 0)
+          (orig (symbol-function
+                 'firefox-to-emacs-native-messenger--write-response))
+          (firefox-to-emacs-native-messenger--handlers
+           (let ((h (make-hash-table :test 'equal)))
+             (puthash "deferred-test"
+                      (lambda (c _r)
+                        (process-put
+                         c
+                         firefox-to-emacs-native-messenger--connection-key-state
+                         'dispatched)
+                        '((cmd . "this-should-not-be-sent")))
+                      h)
+             h)))
+      (cl-letf (((symbol-function
+                  'firefox-to-emacs-native-messenger--write-response)
+                 (lambda (c r) (cl-incf calls) (funcall orig c r))))
+        (let ((frame (firefox-to-emacs-native-messenger-test--build-request-frame
+                      '((cmd . "deferred-test")))))
+          (firefox-to-emacs-native-messenger--connection-filter server frame)
+          (accept-process-output nil 0.2)
+          (should (= 0 calls))
+          (should-not (process-get tc 'received))
+          (should (eq 'dispatched
+                      (process-get
+                       server
+                       firefox-to-emacs-native-messenger--connection-key-state))))))))
+
+(defun firefox-to-emacs-native-messenger-test--make-response-of-byte-length (target-bytes)
+  "Build a synthetic response whose serialized JSON byte length is TARGET-BYTES.
+
+Returns an alist of the form ((cmd . \"x\") (data . PADDING)) where
+PADDING is sized so that the JSON-serialized form is exactly
+TARGET-BYTES bytes long.
+
+Signals an error if TARGET-BYTES is smaller than the minimum overhead
+of the response envelope."
+  (let* ((overhead (length (json-serialize '((cmd . "x") (data . ""))
+                                           :null-object :null
+                                           :false-object :false)))
+         (data-len (- target-bytes overhead)))
+    (when (< data-len 0)
+      (error "target-bytes %d less than overhead %d" target-bytes overhead))
+    (list (cons 'cmd "x") (cons 'data (make-string data-len ?a)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-outbound-cap-boundary-cap-minus-1-sent-verbatim ()
+  "A response whose serialized payload is exactly cap-1 bytes is sent verbatim.
+
+Per PAT-0600 the cap is a strict `> cap' threshold: cap-1 passes the
+check unchanged and reaches the wire as the handler intended."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-paired-clients server tc
+    (should server)
+    (let ((cap 200))
+      (let ((firefox-to-emacs-native-messenger-outbound-response-cap cap))
+        (let* ((resp
+                (firefox-to-emacs-native-messenger-test--make-response-of-byte-length
+                 (1- cap))))
+          (firefox-to-emacs-native-messenger--write-response server resp)
+          (accept-process-output nil 0.2)
+          (let* ((received (process-get tc 'received))
+                 (declared (firefox-to-emacs-native-messenger--unpack-length
+                            (substring received 0 4)))
+                 (payload (substring received 4 (+ 4 declared)))
+                 (parsed (json-parse-string
+                          (decode-coding-string payload 'utf-8)
+                          :object-type 'alist
+                          :null-object nil
+                          :false-object :false)))
+            (should (= declared (1- cap)))
+            (should (equal parsed resp))))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-outbound-cap-boundary-cap-exact-sent-verbatim ()
+  "A response whose serialized payload is exactly cap bytes is sent verbatim.
+
+Per PAT-0600 the cap is `> cap', not `>= cap'.  A payload of exactly
+the cap value passes the check and reaches the wire intact."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-paired-clients server tc
+    (should server)
+    (let ((cap 200))
+      (let ((firefox-to-emacs-native-messenger-outbound-response-cap cap))
+        (let* ((resp
+                (firefox-to-emacs-native-messenger-test--make-response-of-byte-length
+                 cap)))
+          (firefox-to-emacs-native-messenger--write-response server resp)
+          (accept-process-output nil 0.2)
+          (let* ((received (process-get tc 'received))
+                 (declared (firefox-to-emacs-native-messenger--unpack-length
+                            (substring received 0 4)))
+                 (payload (substring received 4 (+ 4 declared)))
+                 (parsed (json-parse-string
+                          (decode-coding-string payload 'utf-8)
+                          :object-type 'alist
+                          :null-object nil
+                          :false-object :false)))
+            (should (= declared cap))
+            (should (equal parsed resp))))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-outbound-cap-boundary-cap-plus-1-replaced ()
+  "A response whose serialized payload is cap+1 bytes is replaced with the oversized error.
+
+Per PAT-0600 a strict over-cap value triggers exactly one replacement
+with the generic `response too large' error."
+  :tags '(:integration :sandbox :fixture-driven)
+  (firefox-to-emacs-native-messenger-test--with-paired-clients server tc
+    (should server)
+    (let ((cap 200))
+      (let ((firefox-to-emacs-native-messenger-outbound-response-cap cap))
+        (let* ((resp
+                (firefox-to-emacs-native-messenger-test--make-response-of-byte-length
+                 (1+ cap))))
+          (firefox-to-emacs-native-messenger--write-response server resp)
+          (accept-process-output nil 0.2)
+          (let* ((received (process-get tc 'received))
+                 (declared (firefox-to-emacs-native-messenger--unpack-length
+                            (substring received 0 4)))
+                 (payload (substring received 4 (+ 4 declared)))
+                 (parsed (json-parse-string
+                          (decode-coding-string payload 'utf-8)
+                          :object-type 'alist
+                          :null-object nil
+                          :false-object :false)))
+            (should (<= declared cap))
+            (should (equal "error" (alist-get 'cmd parsed)))
+            (should (equal "response too large" (alist-get 'error parsed)))))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-outbound-cap-boundary-degenerate-no-frame ()
+  "When the cap is so small that even the error response overflows, no frame is sent.
+
+The wording of the error response is approximately 41 bytes
+serialized; a cap below that triggers the degenerate fallback."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-paired-clients server tc
+    (should server)
+    (let ((firefox-to-emacs-native-messenger-outbound-response-cap 10))
+      (let* ((resp
+              (firefox-to-emacs-native-messenger-test--make-response-of-byte-length
+               50)))
+        (firefox-to-emacs-native-messenger--write-response server resp)
+        (accept-process-output nil 0.2)
+        (should-not (process-get tc 'received))
+        (should (eq 'responded
+                    (process-get
+                     server
+                     firefox-to-emacs-native-messenger--connection-key-state)))))))
 
 (provide 'firefox-to-emacs-native-messenger-tests)
 ;;; firefox-to-emacs-native-messenger-tests.el ends here

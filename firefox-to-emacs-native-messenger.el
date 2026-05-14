@@ -286,6 +286,15 @@ writer has marked the connection responded), or `closing' (teardown in
 progress).  The filter, dispatcher, response writer, and sentinel all
 consult this field to make routing decisions per Section 8.22.")
 
+(defconst firefox-to-emacs-native-messenger--connection-key-cleanup-timer
+  'cleanup-timer
+  "Per-connection plist key for the post-response cleanup timer.
+
+The timer is scheduled by the response writer (PAT-0600 / Section 8.18
+step 6) and cancelled by the per-connection sentinel on peer-close.
+Bounded liveness: timer expiration triggers connection teardown per
+Section 8.22.")
+
 (define-error 'firefox-to-emacs-native-messenger-error
   "firefox-to-emacs-native-messenger bridge error")
 
@@ -1025,25 +1034,13 @@ acknowledgement.  Returns nil unconditionally."
     (delete-process client))
   nil)
 
-(defun firefox-to-emacs-native-messenger--send-response (client response)
-  "Stub response sink for CLIENT and RESPONSE.
-
-The real response writer arrives in the response-writer task
-pair, which serializes RESPONSE to a length-prefixed UTF-8 JSON
-frame and sends it on CLIENT.  This stub exists so the filter's
-parse-error path can route generic-error responses to a stable
-function symbol before the response-writer wiring lands.
-Calling the stub is a no-op."
-  (ignore client response)
-  nil)
-
 (defun firefox-to-emacs-native-messenger--filter-handle-parse-error
     (client error-data)
   "Handle a parse failure on CLIENT with diagnostic ERROR-DATA.
 
 Build a generic error response per PAT-0300 (cmd field set to
 the string \"error\"; error field carrying the parse-error
-message; no code field) and route it through the response-sink
+message; no code field) and route it through the response writer
 helper.  Reset the per-connection plist state so that the
 buffer and declared-length match the post-frame quiescent
 shape (read-buffer empty unibyte string, declared-length nil).
@@ -1061,7 +1058,7 @@ Returns nil unconditionally."
       client
       firefox-to-emacs-native-messenger--connection-key-declared-length
       nil)
-    (firefox-to-emacs-native-messenger--send-response client response)
+    (firefox-to-emacs-native-messenger--write-response client response)
     nil))
 
 (defvar firefox-to-emacs-native-messenger--handlers
@@ -1081,6 +1078,213 @@ Returns an alist with the cmd field set to the literal string
 are present; the response is shape-compatible with the response
 builder that lands in a subsequent phase."
   (list (cons 'cmd "error") (cons 'error message)))
+
+(defun firefox-to-emacs-native-messenger--build-response (response-data)
+  "Apply structural null-stripping to RESPONSE-DATA.
+
+RESPONSE-DATA is an alist of (FIELD-SYMBOL . VALUE) cons cells
+representing a handler's response.  Per PROTOCOL.md S6
+(\"Null-Stripping Rules (Structural, Not Semantic)\"), every
+field whose value is the keyword `:absent' MUST be omitted from
+the output; every other value, including the empty string \"\",
+the integer 0, and the keyword `:false', MUST be preserved
+verbatim.
+
+The keyword `:absent' is the in-process marker the handler uses
+to communicate \"this field is structurally absent\" without
+conflating absence with semantic emptiness.  This distinction is
+mandatory for back-compat with Tridactyl's editor flow, which
+relies on `read' open-failure carrying an empty-string `content'
+rather than an absent `content'.
+
+Callers MUST use `:absent' (not nil) for structural absence;
+nil at the value position is not stripped, and is reserved for
+representing other values per `json-serialize' semantics.
+
+Returns a fresh alist; the input is not mutated.  Insertion order
+is preserved across the surviving fields."
+  (cl-remove-if (lambda (pair) (eq (cdr pair) :absent))
+                response-data))
+
+(defun firefox-to-emacs-native-messenger--serialize-response (stripped-response)
+  "Serialize STRIPPED-RESPONSE to a length-prefixed UTF-8 JSON frame.
+
+STRIPPED-RESPONSE is the post-null-stripping output of
+`firefox-to-emacs-native-messenger--build-response' (an alist whose
+`:absent' fields have already been removed).  The function:
+
+  1. Calls `json-serialize' with `:null-object :null' and
+     `:false-object :false' so the `:false' sentinel emitted by
+     handlers serializes as JSON `false', matching the parser's
+     configuration in the per-connection filter.
+  2. UTF-8 encodes the resulting (potentially multibyte) JSON string
+     to a unibyte string so byte arithmetic is accurate (using
+     `length' on the original multibyte string would understate the
+     byte count for any non-ASCII content).
+  3. Packs the 4-byte little-endian length prefix via the existing
+     codec at REQ-0100 / CON-0800.
+  4. Returns the concatenation of prefix and UTF-8 payload as a
+     unibyte string suitable for `process-send-string'.
+
+The output length is exactly 4 + N where N is the UTF-8 byte length
+of the serialized JSON.
+
+This function does NOT enforce the outbound-response cap; that check
+is the response writer's responsibility per PAT-0600."
+  (let* ((json (json-serialize stripped-response
+                               :null-object :null
+                               :false-object :false))
+         (unibyte (if (multibyte-string-p json)
+                      (encode-coding-string json 'utf-8)
+                    json))
+         (prefix (firefox-to-emacs-native-messenger--pack-length
+                  (length unibyte))))
+    (concat prefix unibyte)))
+
+(defun firefox-to-emacs-native-messenger--cleanup-timer-expire (client)
+  "Post-response cleanup-timer expiration handler for CLIENT.
+
+Performs idempotent teardown: clears the cleanup-timer plist key,
+transitions the connection state to `closing' (per Section 8.22),
+removes the connection from the connection registry, and deletes the
+process if still live.  Safe to invoke after the connection has
+already been deleted."
+  (process-put
+   client
+   firefox-to-emacs-native-messenger--connection-key-cleanup-timer
+   nil)
+  (when (process-live-p client)
+    (process-put
+     client
+     firefox-to-emacs-native-messenger--connection-key-state
+     'closing)
+    (firefox-to-emacs-native-messenger--connection-registry-remove client)
+    (delete-process client)))
+
+(defun firefox-to-emacs-native-messenger--cancel-cleanup-timer (client)
+  "Cancel any post-response cleanup timer on CLIENT.
+
+Idempotent: silent no-op if no timer is set.  Clears the cleanup-timer
+plist key after cancellation so subsequent observers see a clean
+slate."
+  (let ((timer (process-get
+                client
+                firefox-to-emacs-native-messenger--connection-key-cleanup-timer)))
+    (when (timerp timer)
+      (cancel-timer timer))
+    (process-put
+     client
+     firefox-to-emacs-native-messenger--connection-key-cleanup-timer
+     nil)))
+
+(defun firefox-to-emacs-native-messenger--start-cleanup-timer (client)
+  "Schedule the post-response cleanup timer for CLIENT.
+
+Cancels any prior cleanup timer first so re-entry is idempotent.
+The timer fires after the post-response cleanup interval defcustom
+seconds and invokes the cleanup-timer expiration handler per
+Section 8.22 transitions.
+
+Returns the new timer."
+  (firefox-to-emacs-native-messenger--cancel-cleanup-timer client)
+  (let ((timer (run-at-time
+                firefox-to-emacs-native-messenger-post-response-cleanup-timer
+                nil
+                #'firefox-to-emacs-native-messenger--cleanup-timer-expire
+                client)))
+    (process-put
+     client
+     firefox-to-emacs-native-messenger--connection-key-cleanup-timer
+     timer)
+    timer))
+
+(defun firefox-to-emacs-native-messenger--write-response (client response-data)
+  "Build, serialize, and send RESPONSE-DATA on CLIENT.
+
+The complete response writer composite per GUD-300 / Section 8.18 and
+PAT-0600:
+
+  1. Pre-send guard: refuse to send unless CLIENT is live AND its
+     state is one of `reading' or `dispatched'.  Other states are
+     post-response or in-teardown; writing again would double-send.
+
+  2. Build the response (structural null-stripping per PROTOCOL.md
+     S6) and serialize it (length prefix plus UTF-8 JSON).
+
+  3. If the serialized payload exceeds the outbound cap, replace
+     the response with the generic `response too large' error
+     (PROTOCOL.md S11 / fixture `oversized-response-error') and
+     re-serialize.  If the replacement also exceeds the cap (a
+     degenerate configuration), log a critical message, mark state
+     `responded', start the cleanup timer, and send NO frame.
+
+  4. Mark state `responded' BEFORE sending so a concurrent
+     observation cannot see an inconsistent state.
+
+  5. Send the framed payload then `process-send-eof'.  Both calls
+     are wrapped in `condition-case-unless-debug' so a failing send
+     (peer disconnected, EPIPE) is logged at warn level and does not
+     propagate to the caller.
+
+  6. Schedule the post-response cleanup timer from an `unwind-protect'
+     cleanup form so it starts even when the send raises.
+
+Returns nil unconditionally.  Section 8.22 transitions: `reading' or
+`dispatched' -> `responded' here, then `responded' -> `closing' on
+cleanup-timer expiration or sentinel peer-close."
+  (let ((state (process-get
+                client
+                firefox-to-emacs-native-messenger--connection-key-state)))
+    (cond
+     ((or (not (process-live-p client))
+          (not (memq state '(reading dispatched))))
+      (firefox-to-emacs-native-messenger--log
+       'warn
+       "write-response refused: client live=%S state=%s; no frame sent"
+       (process-live-p client) state)
+      nil)
+     (t
+      (let* ((cap firefox-to-emacs-native-messenger-outbound-response-cap)
+             (built (firefox-to-emacs-native-messenger--build-response
+                     response-data))
+             (framed (firefox-to-emacs-native-messenger--serialize-response
+                      built))
+             (payload-len (- (length framed) 4)))
+        (when (> payload-len cap)
+          (firefox-to-emacs-native-messenger--log
+           'warn "response payload %d exceeds cap %d; replacing"
+           payload-len cap)
+          (let* ((replacement
+                  (firefox-to-emacs-native-messenger--build-response
+                   '((cmd . "error") (error . "response too large"))))
+                 (replacement-framed
+                  (firefox-to-emacs-native-messenger--serialize-response
+                   replacement))
+                 (replacement-len (- (length replacement-framed) 4)))
+            (cond
+             ((> replacement-len cap)
+              (firefox-to-emacs-native-messenger--log
+               'error
+               "degenerate oversize: replacement %d still exceeds cap %d on %S; sending no frame"
+               replacement-len cap client)
+              (setq framed nil))
+             (t
+              (setq framed replacement-framed)))))
+        (process-put
+         client
+         firefox-to-emacs-native-messenger--connection-key-state
+         'responded)
+        (unwind-protect
+            (when framed
+              (condition-case-unless-debug err
+                  (progn
+                    (process-send-string client framed)
+                    (process-send-eof client))
+                (error
+                 (firefox-to-emacs-native-messenger--log
+                  'warn "send failed on %S: %S" client err))))
+          (firefox-to-emacs-native-messenger--start-cleanup-timer client)))))
+    nil))
 
 (defun firefox-to-emacs-native-messenger--dispatch-request
     (client request)
@@ -1132,22 +1336,39 @@ Behavior per the Phase 0500 dispatcher contract:
 
 PAYLOAD is the unibyte JSON-encoded request body, exclusive of
 the 4-byte length prefix.  The helper cancels the read-timer,
-decodes the JSON as an alist keyed by symbols, and routes
-either to the dispatcher (on success) or to the parse-error
-handler (on decoding failure)."
+decodes the JSON as an alist keyed by symbols, dispatches the
+request, and routes the dispatcher's response through the
+response writer for synchronous handlers (state still `reading'
+after dispatch).  Asynchronous handlers (state transitioned to
+`dispatched' during the handler's execution) are responsible for
+calling the writer themselves later from their own callbacks; the
+dispatcher MUST NOT call the writer in that case.
+
+JSON-parse failures and any unexpected handler-layer signals are
+routed to `firefox-to-emacs-native-messenger--filter-handle-parse-error',
+which writes a generic error response and resets the read-buffer
+state.  This routing preserves the one-request-one-response wire
+contract per GUD-200."
   (firefox-to-emacs-native-messenger--cancel-read-timer client)
   (condition-case err
-        (let ((request
-            (json-parse-string
-              payload
-              :object-type 'alist
-              :null-object nil
-              :false-object :false)))
-      (firefox-to-emacs-native-messenger--dispatch-request
-        client request))
+      (let* ((request
+              (json-parse-string
+               payload
+               :object-type 'alist
+               :null-object nil
+               :false-object :false))
+             (response
+              (firefox-to-emacs-native-messenger--dispatch-request
+               client request)))
+        (when (eq 'reading
+                  (process-get
+                   client
+                   firefox-to-emacs-native-messenger--connection-key-state))
+          (firefox-to-emacs-native-messenger--write-response
+           client response)))
     (error
-      (firefox-to-emacs-native-messenger--filter-handle-parse-error
-        client err))))
+     (firefox-to-emacs-native-messenger--filter-handle-parse-error
+      client err))))
 
 (defun firefox-to-emacs-native-messenger--filter-reading (client string)
   "Reading-state branch of the per-connection filter.
@@ -1255,6 +1476,7 @@ firefox-to-emacs-native-messenger--close-event-prefixes.  On a
 close event:
 
   - cancels the per-connection read-timeout timer;
+  - cancels the post-response cleanup timer (if scheduled);
   - logs the event, distinguishing peer-close-after-response
     (prior state was responded) from premature peer-close
     (prior state was reading, dispatched, or already closing);
@@ -1269,6 +1491,7 @@ signal) are silently ignored.  Returns nil unconditionally."
             client
             firefox-to-emacs-native-messenger--connection-key-state))
         (trimmed (string-trim event)))
+      (firefox-to-emacs-native-messenger--cancel-cleanup-timer client)
       (firefox-to-emacs-native-messenger--cancel-read-timer client)
       (if (eq prior-state 'responded)
         (firefox-to-emacs-native-messenger--log
