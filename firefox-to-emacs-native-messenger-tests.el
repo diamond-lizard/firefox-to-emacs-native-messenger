@@ -2060,5 +2060,760 @@ connections; dead processes are filtered out of the list."
     (should-not (file-exists-p (expand-file-name "tmp_doomed_b.txt" tmp)))
     (should (file-exists-p (expand-file-name "keep.txt" tmp)))))
 
+
+;;;; Phase 0500 -- accept handler, read timer, filter, dispatcher, sentinel
+
+(defmacro firefox-to-emacs-native-messenger-test--with-accepted-client
+    (server-side-var &rest body)
+  "Start listener; open a client; bind SERVER-SIDE-VAR to the accepted process.
+
+The bound process is the listener-side client endpoint registered in
+the connection registry after the accept handler fires.  The macro
+composes `with-listener-sandbox' and `with-fresh-connection-registry',
+starts the listener, opens a local test-side client connection to the
+bound socket, drains pending I/O via `accept-process-output' with a
+short timeout to let the accept handler fire, binds SERVER-SIDE-VAR to
+the first entry of the connection registry's live list, runs BODY, and
+deletes the test-side client process on exit.
+
+BODY is expected to assert with `should' that SERVER-SIDE-VAR is
+non-nil before consulting it; the binding may be nil if the accept
+handler did not fire (which itself indicates a Phase 0500 regression)."
+  (declare (indent 1) (debug (symbolp body)))
+  (let ((cache-sym (gensym "fenm-test-cache-"))
+        (tmp-sym (gensym "fenm-test-tmp-"))
+        (sock-sym (gensym "fenm-test-sock-"))
+        (test-client-sym (gensym "fenm-test-client-")))
+    `(firefox-to-emacs-native-messenger-test--with-listener-sandbox
+         ,cache-sym ,tmp-sym ,sock-sym
+       (firefox-to-emacs-native-messenger-test--with-fresh-connection-registry
+        (firefox-to-emacs-native-messenger-start)
+        (let ((,test-client-sym
+               (make-network-process
+                :name "fenm-test-accept-client"
+                :family 'local
+                :service ,sock-sym
+                :coding '(binary . binary)
+                :noquery t)))
+          (unwind-protect
+              (progn
+                (accept-process-output nil 0.2)
+                (let ((,server-side-var
+                       (car
+                        (firefox-to-emacs-native-messenger--connection-registry-list))))
+                  ,@body))
+            (when (process-live-p ,test-client-sym)
+              (delete-process ,test-client-sym))))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-accept-handler-registers-connection ()
+  "The accept handler records the new client in the connection registry.
+
+After a client connects to the listener, the connection registry holds
+exactly one live entry (the listener-side endpoint of the connection)."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-accepted-client client
+    (should client)
+    (should (memq client
+                  (firefox-to-emacs-native-messenger--connection-registry-list)))
+    (should (= 1
+               (length
+                (firefox-to-emacs-native-messenger--connection-registry-list))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-accept-handler-sets-noquery ()
+  "The accept handler sets `process-query-on-exit-flag' to nil on the new client."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-accepted-client client
+    (should client)
+    (should-not (process-query-on-exit-flag client))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-accept-handler-attaches-filter ()
+  "The accept handler attaches the per-connection filter to the new client."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-accepted-client client
+    (should client)
+    (should (eq (process-filter client)
+                'firefox-to-emacs-native-messenger--connection-filter))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-accept-handler-attaches-sentinel ()
+  "The accept handler attaches the per-connection sentinel to the new client."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-accepted-client client
+    (should client)
+    (should (eq (process-sentinel client)
+                'firefox-to-emacs-native-messenger--connection-sentinel))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-accept-handler-initializes-plist ()
+  "The accept handler initializes the per-connection plist.
+
+Required initial values: the read buffer is the empty unibyte string;
+the declared length is nil (unset); the read timer is a live timer
+object; the state field is the symbol `reading'."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-accepted-client client
+    (should client)
+    (let ((read-buffer
+           (process-get
+            client
+            firefox-to-emacs-native-messenger--connection-key-read-buffer))
+          (declared-length
+           (process-get
+            client
+            firefox-to-emacs-native-messenger--connection-key-declared-length))
+          (read-timer
+           (process-get
+            client
+            firefox-to-emacs-native-messenger--connection-key-read-timer))
+          (state
+           (process-get
+            client
+            firefox-to-emacs-native-messenger--connection-key-state)))
+      (should (stringp read-buffer))
+      (should (string-empty-p read-buffer))
+      (should-not (multibyte-string-p read-buffer))
+      (should-not declared-length)
+      (should (timerp read-timer))
+      (should (eq state 'reading)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-accept-handler-logs-event ()
+  "The accept handler emits a log entry naming the accept event."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-fresh-log-buffer
+   (firefox-to-emacs-native-messenger-test--with-accepted-client client
+     (should client)
+     (let ((buf (get-buffer
+                 firefox-to-emacs-native-messenger-log-buffer-name)))
+       (should buf)
+       (with-current-buffer buf
+         (should (save-excursion
+                   (goto-char (point-min))
+                   (search-forward "accept" nil t))))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-timer-expire-deletes-connection ()
+  "Read-timer expiration deletes the connection process.
+
+After invoking the expiration handler on a live accepted client, the
+client process is no longer live."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-accepted-client client
+    (should client)
+    (should (process-live-p client))
+    (firefox-to-emacs-native-messenger--read-timer-expire client)
+    (accept-process-output nil 0.1)
+    (should-not (process-live-p client))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-timer-expire-removes-from-registry ()
+  "Read-timer expiration removes the connection from the registry.
+
+The connection-registry hash table must not contain the expired
+client after the expiration handler runs."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-accepted-client client
+    (should client)
+    (should (gethash client
+                     firefox-to-emacs-native-messenger--connection-registry))
+    (firefox-to-emacs-native-messenger--read-timer-expire client)
+    (accept-process-output nil 0.1)
+    (should-not
+     (gethash client
+              firefox-to-emacs-native-messenger--connection-registry))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-timer-expire-logs ()
+  "Read-timer expiration emits a log entry naming the event."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-fresh-log-buffer
+   (firefox-to-emacs-native-messenger-test--with-accepted-client client
+     (should client)
+     (firefox-to-emacs-native-messenger--read-timer-expire client)
+     (let ((buf (get-buffer
+                 firefox-to-emacs-native-messenger-log-buffer-name)))
+       (should buf)
+       (with-current-buffer buf
+         (should (save-excursion
+                   (goto-char (point-min))
+                   (search-forward "read timer" nil t))))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-cancel-read-timer-cancels-timer ()
+  "Cancel removes the per-connection read timer from the active timer list.
+
+Before cancel the timer object is present in timer-list; after cancel
+the timer is no longer scheduled."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-accepted-client client
+    (should client)
+    (let ((timer
+           (process-get
+            client
+            firefox-to-emacs-native-messenger--connection-key-read-timer)))
+      (should (timerp timer))
+      (should (member timer timer-list))
+      (firefox-to-emacs-native-messenger--cancel-read-timer client)
+      (should-not (member timer timer-list)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-cancel-read-timer-clears-plist ()
+  "Cancel clears the read-timer plist key on the connection process.
+
+After cancel the connection's read-timer plist key is nil."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-accepted-client client
+    (should client)
+    (firefox-to-emacs-native-messenger--cancel-read-timer client)
+    (should-not
+     (process-get
+      client
+      firefox-to-emacs-native-messenger--connection-key-read-timer))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-cancel-read-timer-double-cancel-noop ()
+  "Calling cancel a second time on a connection without a timer is harmless.
+
+The second cancel raises no error and leaves the plist key nil."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-accepted-client client
+    (should client)
+    (firefox-to-emacs-native-messenger--cancel-read-timer client)
+    (should-not
+     (condition-case _err
+         (progn
+           (firefox-to-emacs-native-messenger--cancel-read-timer client)
+           nil)
+       (error t)))
+    (should-not
+     (process-get
+      client
+      firefox-to-emacs-native-messenger--connection-key-read-timer))))
+
+(defun firefox-to-emacs-native-messenger-test--frame-bytes (json-string)
+  "Build a length-prefixed frame for the test harness.
+
+Returns a unibyte string consisting of the 4-byte little-endian
+length prefix followed by the UTF-8 encoded bytes of JSON-STRING."
+  (let* ((utf8 (encode-coding-string json-string 'utf-8))
+         (prefix (firefox-to-emacs-native-messenger--pack-length
+                  (length utf8))))
+    (concat prefix utf8)))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-filter-reading-appends-chunks-and-waits ()
+  "Reading-state filter appends chunks to the read buffer and waits for more.
+
+Two short partial sends each fewer than four bytes leave the buffer
+holding the concatenated bytes, the declared length unset, and the
+connection alive."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-accepted-client client
+    (should client)
+    (firefox-to-emacs-native-messenger--connection-filter client "ab")
+    (firefox-to-emacs-native-messenger--connection-filter client "c")
+    (should (equal
+             "abc"
+             (process-get
+              client
+              firefox-to-emacs-native-messenger--connection-key-read-buffer)))
+    (should-not
+     (process-get
+      client
+      firefox-to-emacs-native-messenger--connection-key-declared-length))
+    (should (process-live-p client))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-filter-reading-decodes-prefix ()
+  "Reading-state filter decodes the 4-byte length prefix once 4+ bytes arrive.
+
+After receiving exactly 4 bytes representing length N, the
+declared-length plist key is N, the connection remains alive, and
+the dispatcher has not been invoked."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-accepted-client client
+    (should client)
+    (let ((prefix (firefox-to-emacs-native-messenger--pack-length 100))
+          (calls 0))
+      (cl-letf (((symbol-function
+                  'firefox-to-emacs-native-messenger--dispatch-request)
+                 (lambda (&rest _) (cl-incf calls))))
+        (firefox-to-emacs-native-messenger--connection-filter client prefix))
+      (should (= 100
+                 (process-get
+                  client
+                  firefox-to-emacs-native-messenger--connection-key-declared-length)))
+      (should (= 0 calls))
+      (should (process-live-p client)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-filter-reading-zero-length-closes ()
+  "A zero-length declared frame causes silent close with no dispatch."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-accepted-client client
+    (should client)
+    (let ((prefix (firefox-to-emacs-native-messenger--pack-length 0))
+          (calls 0))
+      (cl-letf (((symbol-function
+                  'firefox-to-emacs-native-messenger--dispatch-request)
+                 (lambda (&rest _) (cl-incf calls))))
+        (firefox-to-emacs-native-messenger--connection-filter client prefix))
+      (should (= 0 calls))
+      (accept-process-output nil 0.05)
+      (should-not (process-live-p client)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-filter-reading-frame-cap-exceeded-closes ()
+  "Frames exceeding the inbound frame cap cause silent close per SEC-0900.
+
+A declared length larger than the configured inbound frame cap causes
+the filter to silently close the connection without invoking the
+dispatcher and without sending any response."
+  :tags '(:integration :sandbox)
+  (let ((firefox-to-emacs-native-messenger-inbound-frame-cap 100))
+    (firefox-to-emacs-native-messenger-test--with-accepted-client client
+      (should client)
+      (let ((prefix (firefox-to-emacs-native-messenger--pack-length 200))
+            (calls 0))
+        (cl-letf (((symbol-function
+                    'firefox-to-emacs-native-messenger--dispatch-request)
+                   (lambda (&rest _) (cl-incf calls))))
+          (firefox-to-emacs-native-messenger--connection-filter client prefix))
+        (should (= 0 calls))
+        (accept-process-output nil 0.05)
+        (should-not (process-live-p client))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-filter-reading-surplus-bytes-closes ()
+  "Surplus bytes after the declared payload cause silent close.
+
+Sending one byte more than the declared length is a violation of the
+one-frame-per-connection contract and the filter closes the
+connection without invoking the dispatcher."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-accepted-client client
+    (should client)
+    (let* ((json "{\"cmd\":\"version\"}")
+           (frame (firefox-to-emacs-native-messenger-test--frame-bytes json))
+           (with-trailing (concat frame "X"))
+           (calls 0))
+      (cl-letf (((symbol-function
+                  'firefox-to-emacs-native-messenger--dispatch-request)
+                 (lambda (&rest _) (cl-incf calls))))
+        (firefox-to-emacs-native-messenger--connection-filter
+         client with-trailing))
+      (should (= 0 calls))
+      (accept-process-output nil 0.05)
+      (should-not (process-live-p client)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-filter-reading-underfilled-waits ()
+  "Underfilled receipt leaves the connection alive without dispatching.
+
+After receiving the 4-byte prefix declaring N bytes plus fewer than N
+payload bytes, the filter buffers what it has, retains the declared
+length, and waits for additional bytes without invoking the
+dispatcher."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-accepted-client client
+    (should client)
+    (let* ((prefix (firefox-to-emacs-native-messenger--pack-length 100))
+           (partial (concat prefix "hello"))
+           (calls 0))
+      (cl-letf (((symbol-function
+                  'firefox-to-emacs-native-messenger--dispatch-request)
+                 (lambda (&rest _) (cl-incf calls))))
+        (firefox-to-emacs-native-messenger--connection-filter client partial))
+      (should (= 0 calls))
+      (should (= 100
+                 (process-get
+                  client
+                  firefox-to-emacs-native-messenger--connection-key-declared-length)))
+      (should (process-live-p client)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-filter-reading-exact-length-dispatches ()
+  "A complete length-prefixed frame triggers the dispatcher with the parsed alist.
+
+The dispatcher receives the original connection process and the
+parsed request as an alist keyed by symbols."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-accepted-client client
+    (should client)
+    (let* ((json "{\"cmd\":\"version\"}")
+           (frame (firefox-to-emacs-native-messenger-test--frame-bytes json))
+           (captured-conn nil)
+           (captured-request nil)
+           (call-count 0))
+      (cl-letf (((symbol-function
+                  'firefox-to-emacs-native-messenger--dispatch-request)
+                 (lambda (conn req)
+                   (cl-incf call-count)
+                   (setq captured-conn conn captured-request req))))
+        (firefox-to-emacs-native-messenger--connection-filter client frame))
+      (should (= 1 call-count))
+      (should (eq captured-conn client))
+      (should (equal "version" (cdr (assq 'cmd captured-request)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-filter-dispatched-state-deletes-process ()
+  "Filter receiving bytes in dispatched state calls delete-process on CLIENT.
+
+The dispatched state means a deferred-response handler is in flight;
+any further bytes from the peer indicate a protocol violation, and
+the filter terminates the connection."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-accepted-client client
+    (should client)
+    (process-put
+     client
+     firefox-to-emacs-native-messenger--connection-key-state
+     'dispatched)
+    (firefox-to-emacs-native-messenger--connection-filter client "anything")
+    (accept-process-output nil 0.05)
+    (should-not (process-live-p client))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-filter-responded-state-ignores ()
+  "Filter receiving bytes in responded state logs and ignores without buffer change."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-accepted-client client
+    (should client)
+    (process-put
+     client
+     firefox-to-emacs-native-messenger--connection-key-state
+     'responded)
+    (let ((saved-buf
+           (process-get
+            client
+            firefox-to-emacs-native-messenger--connection-key-read-buffer)))
+      (firefox-to-emacs-native-messenger--connection-filter client "ignored")
+      (should (process-live-p client))
+      (should (equal
+               saved-buf
+               (process-get
+                client
+                firefox-to-emacs-native-messenger--connection-key-read-buffer))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-filter-closing-state-ignores ()
+  "Filter receiving bytes in closing state logs and ignores without buffer change."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-accepted-client client
+    (should client)
+    (process-put
+     client
+     firefox-to-emacs-native-messenger--connection-key-state
+     'closing)
+    (let ((saved-buf
+           (process-get
+            client
+            firefox-to-emacs-native-messenger--connection-key-read-buffer)))
+      (firefox-to-emacs-native-messenger--connection-filter client "ignored")
+      (should (equal
+               saved-buf
+               (process-get
+                client
+                firefox-to-emacs-native-messenger--connection-key-read-buffer))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-filter-concurrent-connection-independence ()
+  "Two concurrent connections maintain independent read buffers and declared lengths.
+
+Streaming different partial frames to each connection does not
+cross-contaminate the other's per-connection state."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-listener-sandbox
+      cache tmp sock
+    (firefox-to-emacs-native-messenger-test--with-fresh-connection-registry
+     (firefox-to-emacs-native-messenger-start)
+     (let ((c1 (make-network-process
+                :name "fenm-test-c1"
+                :family 'local
+                :service sock
+                :coding '(binary . binary)
+                :noquery t))
+           (c2 (make-network-process
+                :name "fenm-test-c2"
+                :family 'local
+                :service sock
+                :coding '(binary . binary)
+                :noquery t)))
+       (unwind-protect
+           (progn
+             (accept-process-output nil 0.2)
+             (let* ((registered
+                     (firefox-to-emacs-native-messenger--connection-registry-list))
+                    (server-c1 (car registered))
+                    (server-c2 (cadr registered)))
+               (should server-c1)
+               (should server-c2)
+               (should (not (eq server-c1 server-c2)))
+               (firefox-to-emacs-native-messenger--connection-filter
+                server-c1 "abc")
+               (firefox-to-emacs-native-messenger--connection-filter
+                server-c2 "wxyz")
+               (let ((b1 (process-get
+                          server-c1
+                          firefox-to-emacs-native-messenger--connection-key-read-buffer))
+                     (b2 (process-get
+                          server-c2
+                          firefox-to-emacs-native-messenger--connection-key-read-buffer)))
+                 (should (equal "abc" b1))
+                 (should (equal "wxyz" b2)))))
+         (when (process-live-p c1) (delete-process c1))
+         (when (process-live-p c2) (delete-process c2)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-filter-parse-error-invalid-json-sends-error ()
+  "Invalid JSON in a complete frame routes the generic error response.
+
+The response object has cmd equal to error and a stringy error field;
+no other fields are present per PAT-0300."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-accepted-client client
+    (should client)
+    (let* ((invalid "{not valid json")
+           (frame
+            (firefox-to-emacs-native-messenger-test--frame-bytes invalid))
+           (sent '()))
+      (cl-letf (((symbol-function
+                  'firefox-to-emacs-native-messenger--send-response)
+                 (lambda (conn resp) (push (cons conn resp) sent))))
+        (firefox-to-emacs-native-messenger--connection-filter client frame))
+      (should (= 1 (length sent)))
+      (let ((resp (cdar sent)))
+        (should (eq client (caar sent)))
+        (should (equal "error" (alist-get 'cmd resp)))
+        (should (stringp (alist-get 'error resp)))
+        (should-not (alist-get 'code resp))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-filter-parse-error-malformed-utf8-sends-error ()
+  "Malformed UTF-8 in a complete frame routes the generic error response."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-accepted-client client
+    (should client)
+    (let* ((bad-bytes (unibyte-string #xfe #xff))
+           (prefix
+            (firefox-to-emacs-native-messenger--pack-length
+             (length bad-bytes)))
+           (frame (concat prefix bad-bytes))
+           (sent '()))
+      (cl-letf (((symbol-function
+                  'firefox-to-emacs-native-messenger--send-response)
+                 (lambda (conn resp) (push (cons conn resp) sent))))
+        (firefox-to-emacs-native-messenger--connection-filter client frame))
+      (should (= 1 (length sent)))
+      (let ((resp (cdar sent)))
+        (should (equal "error" (alist-get 'cmd resp)))
+        (should (stringp (alist-get 'error resp)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-filter-parse-error-resets-buffer ()
+  "After a parse error the read-buffer plist key is reset to empty."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-accepted-client client
+    (should client)
+    (let* ((invalid "}}}not json")
+           (frame
+            (firefox-to-emacs-native-messenger-test--frame-bytes invalid)))
+      (cl-letf (((symbol-function
+                  'firefox-to-emacs-native-messenger--send-response)
+                 (lambda (&rest _) nil)))
+        (firefox-to-emacs-native-messenger--connection-filter client frame))
+      (should (equal
+               ""
+               (process-get
+                client
+                firefox-to-emacs-native-messenger--connection-key-read-buffer))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-filter-parse-error-resets-declared-length ()
+  "After a parse error the declared-length plist key is reset to nil."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-accepted-client client
+    (should client)
+    (let* ((invalid "}}}not json")
+           (frame
+            (firefox-to-emacs-native-messenger-test--frame-bytes invalid)))
+      (cl-letf (((symbol-function
+                  'firefox-to-emacs-native-messenger--send-response)
+                 (lambda (&rest _) nil)))
+        (firefox-to-emacs-native-messenger--connection-filter client frame))
+      (should-not
+       (process-get
+        client
+        firefox-to-emacs-native-messenger--connection-key-declared-length)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-filter-parse-error-does-not-call-dispatcher ()
+  "A parse failure must not invoke the dispatcher."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-accepted-client client
+    (should client)
+    (let* ((invalid "(this is not json)")
+           (frame
+            (firefox-to-emacs-native-messenger-test--frame-bytes invalid))
+           (dispatch-calls 0))
+      (cl-letf (((symbol-function
+                  'firefox-to-emacs-native-messenger--dispatch-request)
+                 (lambda (&rest _) (cl-incf dispatch-calls)))
+                ((symbol-function
+                  'firefox-to-emacs-native-messenger--send-response)
+                 (lambda (&rest _) nil)))
+        (firefox-to-emacs-native-messenger--connection-filter client frame))
+      (should (= 0 dispatch-calls)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-dispatcher-known-cmd-routes-to-handler ()
+  "A cmd registered in the handler table is invoked with the connection and request."
+  :tags '(:unit)
+  (let ((calls 0)
+        (captured nil))
+    (let ((firefox-to-emacs-native-messenger--handlers
+           (let ((h (make-hash-table :test 'equal)))
+             (puthash "test-known"
+                      (lambda (_c req)
+                        (cl-incf calls)
+                        (setq captured req)
+                        (list (cons 'cmd "test-known-response")))
+                      h)
+             h)))
+      (let ((resp
+             (firefox-to-emacs-native-messenger--dispatch-request
+              nil
+              (list (cons 'cmd "test-known") (cons 'foo 1)))))
+        (should (= 1 calls))
+        (should (equal "test-known" (alist-get 'cmd captured)))
+        (should (equal 1 (alist-get 'foo captured)))
+        (should (equal "test-known-response" (alist-get 'cmd resp)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-dispatcher-unknown-cmd-error ()
+  "An unknown cmd produces the unhandled-message generic error response.
+
+The response carries cmd equal to error and error equal to the
+unhandled-message literal; no other fields are present per PAT-0300."
+  :tags '(:unit)
+  (let ((firefox-to-emacs-native-messenger--handlers
+         (make-hash-table :test 'equal)))
+    (let ((resp
+           (firefox-to-emacs-native-messenger--dispatch-request
+            nil
+            (list (cons 'cmd "nonexistent-cmd")))))
+      (should (equal "error" (alist-get 'cmd resp)))
+      (should (equal "Unhandled message" (alist-get 'error resp)))
+      (should-not (alist-get 'code resp)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-dispatcher-missing-cmd-error ()
+  "A request without a cmd field produces a generic error identifying the missing field."
+  :tags '(:unit)
+  (let ((resp
+         (firefox-to-emacs-native-messenger--dispatch-request
+          nil
+          (list (cons 'foo 1)))))
+    (should (equal "error" (alist-get 'cmd resp)))
+    (should (string-match-p "cmd" (alist-get 'error resp)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-dispatcher-ill-typed-cmd-error ()
+  "A request with a non-string cmd produces the unhandled-message error.
+
+Non-string values for the cmd field (integer, list, nil, vector, etc.)
+are treated identically to unknown cmd values."
+  :tags '(:unit)
+  (dolist (bad-cmd (list 42 'a-symbol '(1 2) nil [1 2]))
+    (let ((resp
+           (firefox-to-emacs-native-messenger--dispatch-request
+            nil
+            (list (cons 'cmd bad-cmd)))))
+      (should (equal "error" (alist-get 'cmd resp)))
+      (should (equal "Unhandled message" (alist-get 'error resp))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-dispatcher-handler-signal-becomes-error ()
+  "A signal raised inside a handler becomes a generic error with the signal's message.
+
+The condition-case-unless-debug wrapper catches the error and
+converts it into the generic error response shape."
+  :tags '(:unit)
+  (let ((debug-on-error nil)
+        (firefox-to-emacs-native-messenger--handlers
+         (let ((h (make-hash-table :test 'equal)))
+           (puthash "boom"
+                    (lambda (_c _r) (error "kaboom-marker"))
+                    h)
+           h)))
+    (let ((resp
+           (firefox-to-emacs-native-messenger--dispatch-request
+            nil
+            (list (cons 'cmd "boom")))))
+      (should (equal "error" (alist-get 'cmd resp)))
+      (should (string-match-p "kaboom-marker" (alist-get 'error resp))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-sentinel-cancels-read-timer ()
+  "On a close event the sentinel cancels the per-connection read timer.
+
+After invocation the read-timer plist key is nil and the timer is
+no longer scheduled in timer-list."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-accepted-client client
+    (should client)
+    (let ((timer
+           (process-get
+            client
+            firefox-to-emacs-native-messenger--connection-key-read-timer)))
+      (should (timerp timer))
+      (firefox-to-emacs-native-messenger--connection-sentinel
+       client "connection broken by remote peer\n")
+      (should-not
+       (process-get
+        client
+        firefox-to-emacs-native-messenger--connection-key-read-timer))
+      (should-not (member timer timer-list)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-sentinel-sets-state-closing ()
+  "On a close event the sentinel sets the connection state to closing."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-accepted-client client
+    (should client)
+    (firefox-to-emacs-native-messenger--connection-sentinel
+     client "deleted\n")
+    (should
+     (eq 'closing
+         (process-get
+          client
+          firefox-to-emacs-native-messenger--connection-key-state)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-sentinel-removes-from-registry ()
+  "On a close event the sentinel removes the connection from the registry."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-accepted-client client
+    (should client)
+    (should
+     (gethash client
+              firefox-to-emacs-native-messenger--connection-registry))
+    (firefox-to-emacs-native-messenger--connection-sentinel
+     client "connection broken by remote peer\n")
+    (should-not
+     (gethash client
+              firefox-to-emacs-native-messenger--connection-registry))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-sentinel-logs-premature-close ()
+  "Peer close before a response causes a premature-close log entry.
+
+The connection's prior state is reading (the default after accept);
+the sentinel's log message must identify the close as premature."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-fresh-log-buffer
+   (firefox-to-emacs-native-messenger-test--with-accepted-client client
+     (should client)
+     (firefox-to-emacs-native-messenger--connection-sentinel
+      client "connection broken by remote peer\n")
+     (let ((buf (get-buffer
+                 firefox-to-emacs-native-messenger-log-buffer-name)))
+       (should buf)
+       (with-current-buffer buf
+         (should
+          (save-excursion
+            (goto-char (point-min))
+            (re-search-forward "premature" nil t))))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-sentinel-logs-peer-close-after-response ()
+  "Peer close after the writer marked responded causes a post-response log entry.
+
+The connection's prior state is responded; the sentinel's log message
+must identify the close as occurring after the response was sent."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-fresh-log-buffer
+   (firefox-to-emacs-native-messenger-test--with-accepted-client client
+     (should client)
+     (process-put
+      client
+      firefox-to-emacs-native-messenger--connection-key-state
+      'responded)
+     (firefox-to-emacs-native-messenger--connection-sentinel
+      client "connection broken by remote peer\n")
+     (let ((buf (get-buffer
+                 firefox-to-emacs-native-messenger-log-buffer-name)))
+       (should buf)
+       (with-current-buffer buf
+         (should
+          (save-excursion
+            (goto-char (point-min))
+            (re-search-forward "after response" nil t))))))))
+
 (provide 'firefox-to-emacs-native-messenger-tests)
 ;;; firefox-to-emacs-native-messenger-tests.el ends here

@@ -244,6 +244,48 @@ The list of LIVE connections is available via
 `firefox-to-emacs-native-messenger--connection-registry-list'; dead
 processes that remain in the table are silently skipped by the lister.")
 
+(defconst firefox-to-emacs-native-messenger--connection-key-read-buffer
+  'read-buffer
+  "Per-connection plist key for the unibyte read buffer.
+
+The value at this key is a unibyte string holding bytes that have
+arrived from the client but have not yet been parsed into a complete
+length-prefixed JSON frame.  The per-connection filter appends incoming
+chunks to this buffer, decodes the length prefix once four bytes have
+arrived, and consumes the full frame once the declared length is
+satisfied.  Per-connection plist keys are defined as defconsts to keep
+plist accesses symbolic (not string-keyed) per Section 8.11.")
+
+(defconst firefox-to-emacs-native-messenger--connection-key-declared-length
+  'declared-length
+  "Per-connection plist key for the declared frame length.
+
+The value at this key is a non-negative integer that the filter has
+decoded from the first four bytes of the read buffer, or nil when the
+buffer has not yet accumulated four bytes.  Once decoded, the value is
+used to determine whether the read buffer holds a complete frame.")
+
+(defconst firefox-to-emacs-native-messenger--connection-key-read-timer
+  'read-timer
+  "Per-connection plist key for the read-timeout timer object.
+
+The value at this key is a timer object scheduled to fire if the
+filter has not produced a complete frame within the configured
+`firefox-to-emacs-native-messenger-read-timer' window, or nil when no
+timer is pending.  Canceled on complete-frame receipt and on connection
+close.")
+
+(defconst firefox-to-emacs-native-messenger--connection-key-state
+  'state
+  "Per-connection plist key for the connection state-machine field.
+
+The value at this key is a symbol drawn from
+`reading' (filter is accumulating the request frame), `dispatched' (a
+deferred-response handler is in flight), `responded' (the response
+writer has marked the connection responded), or `closing' (teardown in
+progress).  The filter, dispatcher, response writer, and sentinel all
+consult this field to make routing decisions per Section 8.22.")
+
 (define-error 'firefox-to-emacs-native-messenger-error
   "firefox-to-emacs-native-messenger bridge error")
 
@@ -900,6 +942,403 @@ guarantees no two adjacent markers (no empty interior literal segment)."
                 (cl-return-from result nil)))
             t)))))))
 
+;;;; Per-connection lifecycle: accept handler, filter and sentinel
+;;;; stubs, and read-timeout timer scaffolding.
+
+(defun firefox-to-emacs-native-messenger--read-timer-expire (client)
+  "Read-timer expiration handler for CLIENT.
+
+Invoked when the per-connection read-timeout timer fires before a
+complete request frame has arrived.  The handler logs the event at
+warn level, removes CLIENT from the connection registry, and deletes
+the underlying process.  Removing from the registry is idempotent
+with the sentinel's removal path: the per-connection sentinel also
+removes on close, so cleanup-path ordering between the two is
+tolerated.
+
+Returns nil unconditionally."
+  (firefox-to-emacs-native-messenger--log
+   'warn "read timer expired; closing connection %S" client)
+  (firefox-to-emacs-native-messenger--connection-registry-remove client)
+  (when (process-live-p client)
+    (delete-process client))
+  nil)
+
+(defun firefox-to-emacs-native-messenger--cancel-read-timer (client)
+  "Cancel the per-connection read-timeout timer for CLIENT.
+
+Reads the timer object stored on the client's plist under
+firefox-to-emacs-native-messenger--connection-key-read-timer; if
+the value is non-nil, calls cancel-timer to remove it from the
+active timer list.  Clears the plist key to nil unconditionally
+so that a subsequent cancel call observes the same nil state.
+
+Safe to call when no timer is scheduled: a nil timer is treated
+as a silent no-op, supporting the double-cancel contract.
+
+Returns nil unconditionally."
+  (let ((timer
+         (process-get
+          client
+          firefox-to-emacs-native-messenger--connection-key-read-timer)))
+    (when timer
+      (cancel-timer timer))
+    (process-put
+     client
+     firefox-to-emacs-native-messenger--connection-key-read-timer
+     nil))
+  nil)
+
+(defun firefox-to-emacs-native-messenger--start-read-timer (client)
+  "Schedule the per-connection read-timeout timer for CLIENT.
+
+The timer is configured to fire after
+`firefox-to-emacs-native-messenger-read-timer' seconds, at which
+point `firefox-to-emacs-native-messenger--read-timer-expire' is
+invoked on CLIENT.  The freshly-created timer is stored on the
+client's plist under
+`firefox-to-emacs-native-messenger--connection-key-read-timer'.
+Returns the timer object."
+  (let ((timer
+         (run-at-time
+          firefox-to-emacs-native-messenger-read-timer
+          nil
+          #'firefox-to-emacs-native-messenger--read-timer-expire
+          client)))
+    (process-put
+     client
+     firefox-to-emacs-native-messenger--connection-key-read-timer
+     timer)
+    timer))
+
+(defun firefox-to-emacs-native-messenger--close-connection (client)
+  "Silently close CLIENT after a protocol violation or timeout.
+
+Cancels the per-connection read-timeout timer, removes the
+connection from the connection registry, and deletes the
+underlying process.  The bridge MUST NOT emit any response on
+these paths per SEC-0900; the connection is torn down without
+acknowledgement.  Returns nil unconditionally."
+  (firefox-to-emacs-native-messenger--cancel-read-timer client)
+  (firefox-to-emacs-native-messenger--connection-registry-remove client)
+  (when (process-live-p client)
+    (delete-process client))
+  nil)
+
+(defun firefox-to-emacs-native-messenger--send-response (client response)
+  "Stub response sink for CLIENT and RESPONSE.
+
+The real response writer arrives in the response-writer task
+pair, which serializes RESPONSE to a length-prefixed UTF-8 JSON
+frame and sends it on CLIENT.  This stub exists so the filter's
+parse-error path can route generic-error responses to a stable
+function symbol before the response-writer wiring lands.
+Calling the stub is a no-op."
+  (ignore client response)
+  nil)
+
+(defun firefox-to-emacs-native-messenger--filter-handle-parse-error
+    (client error-data)
+  "Handle a parse failure on CLIENT with diagnostic ERROR-DATA.
+
+Build a generic error response per PAT-0300 (cmd field set to
+the string \"error\"; error field carrying the parse-error
+message; no code field) and route it through the response-sink
+helper.  Reset the per-connection plist state so that the
+buffer and declared-length match the post-frame quiescent
+shape (read-buffer empty unibyte string, declared-length nil).
+The dispatcher is deliberately not invoked on this path.
+
+Returns nil unconditionally."
+  (let ((response
+        (list (cons 'cmd "error")
+          (cons 'error (error-message-string error-data)))))
+    (process-put
+      client
+      firefox-to-emacs-native-messenger--connection-key-read-buffer
+      (unibyte-string))
+    (process-put
+      client
+      firefox-to-emacs-native-messenger--connection-key-declared-length
+      nil)
+    (firefox-to-emacs-native-messenger--send-response client response)
+    nil))
+
+(defvar firefox-to-emacs-native-messenger--handlers
+  (make-hash-table :test 'equal)
+  "Handler registry mapping cmd strings to handler functions.
+
+The dispatcher consults this registry on each request; on a miss
+the unhandled-message generic error response is returned.
+Handlers are registered by the per-cmd implementation phases
+(Phase 0700 for the synchronous cmds, Phase 0800 for run).")
+
+(defun firefox-to-emacs-native-messenger--build-error-response (message)
+  "Build the generic error response per PAT-0300 with MESSAGE.
+
+Returns an alist with the cmd field set to the literal string
+\"error\" and the error field set to MESSAGE.  No other fields
+are present; the response is shape-compatible with the response
+builder that lands in a subsequent phase."
+  (list (cons 'cmd "error") (cons 'error message)))
+
+(defun firefox-to-emacs-native-messenger--dispatch-request
+    (client request)
+  "Dispatch REQUEST on CLIENT to its registered handler.
+
+Returns the response object.  Sending is performed by the
+response writer in a subsequent phase, not by this function.
+
+Behavior per the Phase 0500 dispatcher contract:
+
+  - If REQUEST has no cmd field, returns the generic error
+    response naming the missing field.
+  - If the cmd field is non-string, returns the
+    unhandled-message error response.
+  - If the cmd string is not registered in
+    firefox-to-emacs-native-messenger--handlers, returns the
+    unhandled-message error response.
+  - Otherwise invokes the handler with CLIENT and REQUEST.
+    Errors raised inside the handler are caught with
+    condition-case-unless-debug and converted into the generic
+    error response carrying the signal's message."
+  (let ((cmd-pair (and (listp request) (assq 'cmd request))))
+    (cond
+      ((null cmd-pair)
+        (firefox-to-emacs-native-messenger--build-error-response
+          "missing cmd field"))
+      ((not (stringp (cdr cmd-pair)))
+        (firefox-to-emacs-native-messenger--build-error-response
+          "Unhandled message"))
+      (t
+        (let* ((cmd (cdr cmd-pair))
+              (handler
+                (gethash
+                  cmd firefox-to-emacs-native-messenger--handlers)))
+          (cond
+            ((null handler)
+              (firefox-to-emacs-native-messenger--build-error-response
+                "Unhandled message"))
+            (t
+              (condition-case-unless-debug err
+                    (funcall handler client request)
+                (error
+                  (firefox-to-emacs-native-messenger--build-error-response
+                    (error-message-string err)))))))))))
+
+(defun firefox-to-emacs-native-messenger--filter-on-complete-frame
+    (client payload)
+  "Handle a complete request frame's PAYLOAD bytes on CLIENT.
+
+PAYLOAD is the unibyte JSON-encoded request body, exclusive of
+the 4-byte length prefix.  The helper cancels the read-timer,
+decodes the JSON as an alist keyed by symbols, and routes
+either to the dispatcher (on success) or to the parse-error
+handler (on decoding failure)."
+  (firefox-to-emacs-native-messenger--cancel-read-timer client)
+  (condition-case err
+        (let ((request
+            (json-parse-string
+              payload
+              :object-type 'alist
+              :null-object nil
+              :false-object :false)))
+      (firefox-to-emacs-native-messenger--dispatch-request
+        client request))
+    (error
+      (firefox-to-emacs-native-messenger--filter-handle-parse-error
+        client err))))
+
+(defun firefox-to-emacs-native-messenger--filter-reading (client string)
+  "Reading-state branch of the per-connection filter.
+
+Appends STRING to CLIENT's read buffer, decodes the 4-byte
+length prefix once enough bytes have accumulated, enforces the
+inbound frame-size cap per SEC-0200/SEC-0900, rejects
+zero-length frames, rejects buffers carrying surplus bytes
+after the declared payload, and dispatches once the buffer
+contains exactly the declared payload.  Underfilled buffers
+wait silently for additional bytes; the read-timeout timer
+will eventually fire if the peer never sends them."
+  (let* ((buf-key
+          firefox-to-emacs-native-messenger--connection-key-read-buffer)
+        (len-key
+          firefox-to-emacs-native-messenger--connection-key-declared-length)
+        (buf (concat (process-get client buf-key) string))
+        (cap firefox-to-emacs-native-messenger-inbound-frame-cap))
+    (process-put client buf-key buf)
+    (when (and (null (process-get client len-key))
+            (>= (length buf) 4))
+      (process-put
+        client len-key
+        (firefox-to-emacs-native-messenger--unpack-length
+          (substring buf 0 4))))
+    (let ((declared (process-get client len-key)))
+      (cond
+        ((null declared) nil)
+        ((> declared cap)
+          (firefox-to-emacs-native-messenger--log
+            'warn "frame size %d exceeds cap %d; closing %S"
+            declared cap client)
+          (firefox-to-emacs-native-messenger--close-connection client))
+        ((zerop declared)
+          (firefox-to-emacs-native-messenger--log
+            'warn "zero-length frame; closing %S" client)
+          (firefox-to-emacs-native-messenger--close-connection client))
+        ((< (length buf) (+ 4 declared)) nil)
+        ((> (length buf) (+ 4 declared))
+          (firefox-to-emacs-native-messenger--log
+            'warn "surplus bytes after complete frame; closing %S" client)
+          (firefox-to-emacs-native-messenger--close-connection client))
+        (t
+          (firefox-to-emacs-native-messenger--filter-on-complete-frame
+            client (substring buf 4)))))))
+
+(defun firefox-to-emacs-native-messenger--connection-filter (client string)
+  "Per-connection filter for the bridge listener's accepted clients.
+
+STRING is the chunk of bytes most recently received from the
+peer.  The filter dispatches on the connection's state plist
+field per Section 8.22:
+
+  - reading: accumulate bytes, decode the length prefix, parse
+    a complete frame and hand it to the dispatcher; silently
+    close the connection on protocol violations (zero-length
+    frame, oversize frame, surplus bytes after the payload)
+    per SEC-0900.
+  - dispatched: a deferred-response handler is in flight; any
+    further bytes from the peer are a protocol violation, so
+    delete the process and let the sentinel finalize cleanup.
+  - responded or closing: teardown is in progress; log and
+    ignore the incoming bytes."
+  (let ((state
+        (process-get
+          client
+          firefox-to-emacs-native-messenger--connection-key-state)))
+    (cond
+      ((eq state 'reading)
+        (firefox-to-emacs-native-messenger--filter-reading client string))
+      ((eq state 'dispatched)
+        (firefox-to-emacs-native-messenger--log
+          'warn "bytes received in dispatched state; closing %S" client)
+        (when (process-live-p client)
+          (delete-process client)))
+      (t
+        (firefox-to-emacs-native-messenger--log
+          'debug "bytes received in state %s on %S; ignoring" state client)
+        nil))))
+
+(defconst firefox-to-emacs-native-messenger--close-event-prefixes
+  '("deleted" "finished" "exited" "killed" "connection broken")
+  "Process-event prefixes recognized as connection-close indications.
+The per-connection sentinel reacts on any event whose textual
+representation starts with one of these prefixes; non-close events
+(typically \"open from ...\") are silently ignored.")
+
+(defun firefox-to-emacs-native-messenger--close-event-p (event)
+  "Return non-nil if EVENT describes a connection-close transition.
+
+EVENT is the textual event string passed to the process sentinel.
+Recognition is by prefix-match against
+firefox-to-emacs-native-messenger--close-event-prefixes."
+  (and (stringp event)
+    (seq-some
+      (lambda (prefix) (string-prefix-p prefix event))
+      firefox-to-emacs-native-messenger--close-event-prefixes)))
+
+(defun firefox-to-emacs-native-messenger--connection-sentinel (client event)
+  "Per-connection sentinel for the bridge listener's accepted clients.
+
+Invoked by Emacs on every state transition of CLIENT.  The
+sentinel reacts only to close-like events per
+firefox-to-emacs-native-messenger--close-event-prefixes.  On a
+close event:
+
+  - cancels the per-connection read-timeout timer;
+  - logs the event, distinguishing peer-close-after-response
+    (prior state was responded) from premature peer-close
+    (prior state was reading, dispatched, or already closing);
+  - sets the connection state to closing;
+  - removes the connection from the connection registry.
+
+Non-close events (most commonly Emacs's accept-side \"open\"
+signal) are silently ignored.  Returns nil unconditionally."
+  (when (firefox-to-emacs-native-messenger--close-event-p event)
+    (let ((prior-state
+          (process-get
+            client
+            firefox-to-emacs-native-messenger--connection-key-state))
+        (trimmed (string-trim event)))
+      (firefox-to-emacs-native-messenger--cancel-read-timer client)
+      (if (eq prior-state 'responded)
+        (firefox-to-emacs-native-messenger--log
+          'info "peer close after response on %S (event: %s)"
+          client trimmed)
+        (firefox-to-emacs-native-messenger--log
+          'warn
+          "premature peer close on %S in state %s (event: %s)"
+          client prior-state trimmed))
+      (process-put
+        client
+        firefox-to-emacs-native-messenger--connection-key-state
+        'closing)
+      (firefox-to-emacs-native-messenger--connection-registry-remove
+        client)))
+  nil)
+
+(defun firefox-to-emacs-native-messenger--accept-handler
+    (_server client message)
+  "Install per-connection state on newly-accepted CLIENT.
+
+Installed as the listener's `:log' callback by
+`firefox-to-emacs-native-messenger-start'.  Emacs invokes this
+function with the server process, the freshly-created client
+process, and a textual MESSAGE describing the event (for accepted
+connections the message begins with the literal \"accept\").
+
+On an accept event the handler:
+
+  - sets `process-query-on-exit-flag' to nil on CLIENT;
+  - attaches the per-connection filter and sentinel functions;
+  - initializes the per-connection plist (empty unibyte read
+    buffer, declared length unset, state `reading');
+  - schedules the read-timeout timer;
+  - registers CLIENT in the connection registry;
+  - emits an info-level log entry naming the accept event.
+
+Non-accept events (server-process failures, ...) are forwarded to
+the logger at info level and otherwise ignored."
+  (cond
+   ((and (stringp message)
+         (string-prefix-p "accept" message))
+    (set-process-query-on-exit-flag client nil)
+    (set-process-filter
+     client
+     #'firefox-to-emacs-native-messenger--connection-filter)
+    (set-process-sentinel
+     client
+     #'firefox-to-emacs-native-messenger--connection-sentinel)
+    (process-put
+     client
+     firefox-to-emacs-native-messenger--connection-key-read-buffer
+     (unibyte-string))
+    (process-put
+     client
+     firefox-to-emacs-native-messenger--connection-key-declared-length
+     nil)
+    (process-put
+     client
+     firefox-to-emacs-native-messenger--connection-key-state
+     'reading)
+    (firefox-to-emacs-native-messenger--start-read-timer client)
+    (firefox-to-emacs-native-messenger--connection-registry-add client)
+    (firefox-to-emacs-native-messenger--log
+     'info "accept connection %S" client))
+   (t
+    (firefox-to-emacs-native-messenger--log
+     'info "listener event: %s"
+     (if (stringp message) message (format "%S" message))))))
+
 ;;;###autoload
 (defun firefox-to-emacs-native-messenger-start ()
   "Start the bridge listener, binding the Unix-domain socket at FILE-0600.
@@ -944,7 +1383,8 @@ case."
                :service firefox-to-emacs-native-messenger-socket-path
                :coding '(binary . binary)
                :filter-multibyte nil
-               :noquery t)))
+               :noquery t
+               :log #'firefox-to-emacs-native-messenger--accept-handler)))
     (setq firefox-to-emacs-native-messenger--listener-process proc)
     (add-hook 'kill-emacs-hook
               'firefox-to-emacs-native-messenger--cleanup-on-shutdown)
