@@ -141,6 +141,15 @@ producing output.")
 The daemon's numeric UID is appended at runtime to form the per-UID
 tempfile directory path.")
 
+(defconst firefox-to-emacs-native-messenger-tempfile-directory
+  (format "%s%d/"
+          firefox-to-emacs-native-messenger-tempfile-directory-base-prefix
+          (user-uid))
+  "Per-UID dedicated tempfile directory at FILE-1600.
+Derived from `firefox-to-emacs-native-messenger-tempfile-directory-base-prefix'
+and the daemon's numeric UID; verified to exist at mode 0700 on every
+listener start.  Holds tempfiles created by the `temp' handler.")
+
 (defconst firefox-to-emacs-native-messenger-cache-directory
   (expand-file-name "firefox-to-emacs-native-messenger/" (xdg-cache-home))
   "Runtime cache directory at FILE-0800.
@@ -216,6 +225,24 @@ Maps absolute tempfile paths to a plist recording the file's identity
 is cleared on listener start and stop; it is pruned on access when a
 path no longer matches its stored identity.  Bounded by
 `firefox-to-emacs-native-messenger-temp-registry-cap'.")
+
+(defvar firefox-to-emacs-native-messenger--listener-process nil
+  "The bridge's currently-active listener process, or nil when none is running.
+Set by `firefox-to-emacs-native-messenger-start' after a successful bind;
+cleared by `firefox-to-emacs-native-messenger-stop'.  A non-nil value
+makes a subsequent `start' refuse with `bad-state' to enforce listener
+idempotency (one listener per UID per daemon).")
+
+(defvar firefox-to-emacs-native-messenger--connection-registry
+  (make-hash-table :test 'eq)
+  "Module-level registry of currently-active client connection processes.
+
+A hash table keyed by the per-connection process object (test `eq').
+Populated by the accept handler when a client connects (Phase 0500);
+entries are removed by the per-connection sentinel or by listener stop.
+The list of LIVE connections is available via
+`firefox-to-emacs-native-messenger--connection-registry-list'; dead
+processes that remain in the table are silently skipped by the lister.")
 
 (define-error 'firefox-to-emacs-native-messenger-error
   "firefox-to-emacs-native-messenger bridge error")
@@ -538,6 +565,279 @@ file) the entry is pruned and the function returns nil."
     (dolist (k keys)
       (firefox-to-emacs-native-messenger--registry-contains-p k))))
 
+(defun firefox-to-emacs-native-messenger--registry-clear-on-start ()
+  "Empty the capability registry as part of the listener-start sequence.
+
+Per Section 8.8 / REQ-3000, the capability registry survives only within
+a single listener lifetime; on listener start the registry is cleared
+AFTER the FILE-1600 tempfile sweep (the sweep removes the on-disk files
+that the prior lifetime's registry referred to, so clearing the in-memory
+state afterward leaves the bridge in a consistent empty-but-bounded
+state).  The ordering against the FILE-1600 sweep is enforced by the
+listener-start composition; this function is the unconditional clear
+hook.  Idempotent: calling repeatedly leaves the registry empty."
+  (clrhash firefox-to-emacs-native-messenger--capability-registry))
+
+(defun firefox-to-emacs-native-messenger--registry-clear-on-stop ()
+  "Empty the capability registry as part of the listener-stop sequence.
+
+Per Section 8.8 / REQ-3000 / SEC-1200, listener stop invalidates every
+prior registration; subsequent listener starts re-establish an empty
+registry.  Idempotent: calling repeatedly leaves the registry empty."
+  (clrhash firefox-to-emacs-native-messenger--capability-registry))
+
+(defun firefox-to-emacs-native-messenger--connection-registry-add (proc)
+  "Add connection process PROC to the connection registry.
+PROC's value cell is t in the registry; subsequent reads use the key."
+  (puthash proc t firefox-to-emacs-native-messenger--connection-registry))
+
+(defun firefox-to-emacs-native-messenger--connection-registry-remove (proc)
+  "Remove connection process PROC from the connection registry.
+Silent no-op when PROC is not registered."
+  (remhash proc firefox-to-emacs-native-messenger--connection-registry))
+
+(defun firefox-to-emacs-native-messenger--connection-registry-clear ()
+  "Empty the connection registry."
+  (clrhash firefox-to-emacs-native-messenger--connection-registry))
+
+(defun firefox-to-emacs-native-messenger--connection-registry-list ()
+  "Return the list of live connection processes registered in the registry.
+Dead processes that linger in the table are silently filtered out."
+  (let (live)
+    (maphash
+     (lambda (proc _v)
+       (when (process-live-p proc) (push proc live)))
+     firefox-to-emacs-native-messenger--connection-registry)
+    live))
+
+(defun firefox-to-emacs-native-messenger--listener-start-whitelist-sweep ()
+  "Validate every whitelist defcustom before allowing listener start.
+
+Implements site 2 of PAT-1100's three-site validation tower (REQ-4100):
+iterates over each entry in
+`firefox-to-emacs-native-messenger--whitelist-kinds' and invokes the
+shared validator
+\(`firefox-to-emacs-native-messenger--validate-whitelist') on the
+current value of that defcustom.  On any malformed value the validator
+signals `firefox-to-emacs-native-messenger-whitelist-malformed' from
+this function, refusing listener start before any socket is bound.
+
+Returns t on success."
+  (dolist (entry firefox-to-emacs-native-messenger--whitelist-kinds)
+    (firefox-to-emacs-native-messenger--validate-whitelist
+     (symbol-value (car entry))
+     (cdr entry)))
+  t)
+
+(defun firefox-to-emacs-native-messenger--cleanup-on-shutdown ()
+  "Run on `kill-emacs-hook' to sweep stale tempfiles before Emacs exits.
+
+Invokes `firefox-to-emacs-native-messenger--sweep-tempfiles' against
+FILE-1600 so that `tmp_*.txt' entries created by the `temp' handler do
+not outlive the daemon.  Wrapped in `condition-case' so errors here
+never block Emacs shutdown (per GUD-400 logger discipline applied to
+the shutdown path)."
+  (condition-case err
+      (firefox-to-emacs-native-messenger--sweep-tempfiles)
+    (error
+     (firefox-to-emacs-native-messenger--log
+      'warn "cleanup-on-shutdown raised: %S" err))))
+
+(defun firefox-to-emacs-native-messenger--verify-cache-directory ()
+  "Ensure the bridge cache directory exists at mode 0700 and is a real directory.
+
+Behavior per SEC-0500 and the Phase 0400 design:
+
+  - If `firefox-to-emacs-native-messenger-cache-directory' does not exist,
+    it is created (with all needed parents) under umask 077, then its mode
+    is explicitly set to 0700 to neutralize any inherited umask.
+  - If the path exists and `file-symlink-p' returns non-nil for its
+    canonical name, the function signals
+    `firefox-to-emacs-native-messenger-bad-state' (a symlink at this
+    location could redirect socket and PID-file writes to an
+    attacker-controlled target, even within the same UID).
+  - If the path exists as a real directory whose mode is exactly 0700,
+    the function returns normally.
+  - In every other case (regular file, wrong mode, ...) the function
+    signals `firefox-to-emacs-native-messenger-bad-state'."
+  (let* ((dir firefox-to-emacs-native-messenger-cache-directory)
+         (without-slash (directory-file-name dir)))
+    (cond
+     ((not (file-exists-p without-slash))
+      (with-file-modes #o700
+        (make-directory dir t))
+      (set-file-modes without-slash #o700))
+     ((file-symlink-p without-slash)
+      (signal 'firefox-to-emacs-native-messenger-bad-state
+              (list "cache directory path is a symlink" dir)))
+     ((not (file-directory-p without-slash))
+      (signal 'firefox-to-emacs-native-messenger-bad-state
+              (list "cache directory path is not a directory" dir)))
+     ((/= (logand (file-modes without-slash) #o7777) #o700)
+      (signal 'firefox-to-emacs-native-messenger-bad-state
+              (list "cache directory mode is not 0700" dir
+                    (format "%o" (logand (file-modes without-slash) #o7777))))))))
+(defun firefox-to-emacs-native-messenger--verify-tempfile-directory ()
+  "Ensure the bridge tempfile directory exists at mode 0700 as a real directory.
+
+The tempfile directory at FILE-1600
+\(`firefox-to-emacs-native-messenger-tempfile-directory') hosts every file
+created by the `temp' handler.  Behavior per SEC-1100:
+
+  - If the directory does not exist, it is created (with all needed
+    parents) under umask 077, then its mode is explicitly set to 0700
+    to neutralize any inherited umask.
+  - If the path exists and `file-symlink-p' returns non-nil for its
+    canonical name, the function signals
+    `firefox-to-emacs-native-messenger-bad-state' (a symlink at this
+    location could redirect tempfile writes to an attacker-controlled
+    target, even within the same UID).
+  - If the path exists as a regular file rather than a directory, the
+    function signals `firefox-to-emacs-native-messenger-bad-state'.
+  - If the path exists as a real directory whose mode differs from
+    0700, the function signals
+    `firefox-to-emacs-native-messenger-bad-state'.
+  - If the path exists as a real 0700 directory NOT owned by the
+    daemon's effective UID, the function signals
+    `firefox-to-emacs-native-messenger-bad-state'."
+  (let* ((dir firefox-to-emacs-native-messenger-tempfile-directory)
+         (without-slash (directory-file-name dir)))
+    (cond
+     ((not (file-exists-p without-slash))
+      (with-file-modes #o700
+        (make-directory dir t))
+      (set-file-modes without-slash #o700))
+     ((file-symlink-p without-slash)
+      (signal 'firefox-to-emacs-native-messenger-bad-state
+              (list "tempfile directory path is a symlink" dir)))
+     ((not (file-directory-p without-slash))
+      (signal 'firefox-to-emacs-native-messenger-bad-state
+              (list "tempfile directory path is not a directory" dir)))
+     ((/= (logand (file-modes without-slash) #o7777) #o700)
+      (signal 'firefox-to-emacs-native-messenger-bad-state
+              (list "tempfile directory mode is not 0700" dir
+                    (format "%o" (logand (file-modes without-slash) #o7777)))))
+     ((/= (file-attribute-user-id (file-attributes without-slash))
+          (user-uid))
+      (signal 'firefox-to-emacs-native-messenger-bad-state
+              (list "tempfile directory is not owned by daemon UID" dir
+                    (file-attribute-user-id (file-attributes without-slash))
+                    (user-uid)))))))
+
+(defun firefox-to-emacs-native-messenger--path-is-real-socket-p (path)
+  "Return non-nil if PATH names a real (non-symlink) UNIX socket file.
+
+Uses `file-attributes' to read both the type bit of the mode-string and
+the symlink target; rejects symlinks even when their target is a socket."
+  (let ((attrs (file-attributes path)))
+    (and attrs
+         (null (file-attribute-type attrs))
+         (let ((modes (file-attribute-modes attrs)))
+           (and (stringp modes)
+                (> (length modes) 0)
+                (eq (aref modes 0) ?s))))))
+
+(defun firefox-to-emacs-native-messenger--socket-connectable-p (path)
+  "Return non-nil if a client connection to UNIX socket PATH succeeds.
+
+Opens a transient AF_UNIX client to PATH and immediately tears it down;
+returns t iff the connect completed.  Used to distinguish a live listener
+from a stale socket file before unlinking."
+  (let ((proc (condition-case _err
+                  (make-network-process
+                   :name "fenm-probe-client"
+                   :family 'local
+                   :service path
+                   :coding '(binary . binary)
+                   :filter-multibyte nil
+                   :noquery t)
+                (error nil))))
+    (when proc
+      (unwind-protect
+          t
+        (when (process-live-p proc) (delete-process proc))))))
+
+(defun firefox-to-emacs-native-messenger--probe-and-delete-stale-socket
+    (socket-path)
+  "Per PAT-0100 / Section 8.21: clear any stale socket file at SOCKET-PATH.
+
+Behavior:
+  - If SOCKET-PATH does not exist, returns nil (caller proceeds to bind).
+  - If SOCKET-PATH is a symlink, signals
+    `firefox-to-emacs-native-messenger-bad-state' (a symlink could
+    redirect the subsequent bind to an attacker-controlled location).
+  - If a client connection to SOCKET-PATH succeeds, a live listener is
+    still bound; signals `firefox-to-emacs-native-messenger-bad-state'.
+  - If the connect fails and SOCKET-PATH is NOT a real socket file
+    (e.g., regular file, directory, FIFO), signals
+    `firefox-to-emacs-native-messenger-bad-state' (the bridge refuses
+    to clobber an unexpected file at the configured socket path).
+  - Otherwise (connect failed AND SOCKET-PATH is a real socket file
+    with no live listener), unlinks SOCKET-PATH via `delete-file' so
+    the caller's subsequent bind can succeed."
+  (when (file-exists-p socket-path)
+    (cond
+     ((file-symlink-p socket-path)
+      (signal 'firefox-to-emacs-native-messenger-bad-state
+              (list "socket path is a symlink" socket-path)))
+     ((firefox-to-emacs-native-messenger--socket-connectable-p socket-path)
+      (signal 'firefox-to-emacs-native-messenger-bad-state
+              (list "live listener already bound to socket path"
+                    socket-path)))
+     ((not (firefox-to-emacs-native-messenger--path-is-real-socket-p
+            socket-path))
+      (signal 'firefox-to-emacs-native-messenger-bad-state
+              (list "non-socket file at configured socket path"
+                    socket-path)))
+     (t
+      (delete-file socket-path)))))
+
+(defconst firefox-to-emacs-native-messenger--tempfile-glob "tmp_*.txt"
+  "Filename glob matched by `--sweep-tempfiles' inside FILE-1600.
+Mirrors the `make-temp-file' shape produced by the `temp' handler:
+prefix `tmp_<sanitized>_<emacs-uniqueness>' plus the literal `.txt'
+suffix.  Entries in FILE-1600 not matching this glob are preserved
+by the sweep.")
+
+(defun firefox-to-emacs-native-messenger--sweep-tempfiles ()
+  "Delete every `tmp_*.txt' entry in the bridge's tempfile directory.
+
+Operates on `firefox-to-emacs-native-messenger-tempfile-directory'
+\(FILE-1600).  Only files matching the
+`firefox-to-emacs-native-messenger--tempfile-glob' filename pattern at
+the top level are removed; non-matching entries (subdirectories,
+unrelated files, dotfiles) are preserved.  A count summary is written
+to the bridge log at info level naming the number of files deleted and
+the number preserved.  Returns the count of files deleted."
+  (let ((dir firefox-to-emacs-native-messenger-tempfile-directory)
+        (deleted 0)
+        (preserved 0))
+    (when (file-directory-p dir)
+      (dolist (entry (directory-files dir t directory-files-no-dot-files-regexp t))
+        (let ((basename (file-name-nondirectory entry)))
+          (cond
+           ((and (file-regular-p entry)
+                 (not (file-symlink-p entry))
+                 (let ((case-fold-search nil))
+                   (string-match-p
+                    (concat
+                     "\\`"
+                     (wildcard-to-regexp
+                      firefox-to-emacs-native-messenger--tempfile-glob)
+                     "\\'")
+                    basename)))
+            (condition-case err
+                (progn (delete-file entry) (cl-incf deleted))
+              (error
+               (cl-incf preserved)
+               (firefox-to-emacs-native-messenger--log
+                'warn "sweep: failed to delete %s: %S" entry err))))
+           (t (cl-incf preserved))))))
+    (firefox-to-emacs-native-messenger--log
+     'info "sweep: deleted %d files, preserved %d in %s"
+     deleted preserved dir)
+    deleted))
+
 (defun firefox-to-emacs-native-messenger--command-gate-match-p (entry candidate)
   "Return non-nil if CANDIDATE matches the run-whitelist template ENTRY.
 
@@ -599,6 +899,107 @@ guarantees no two adjacent markers (no empty interior literal segment)."
               (unless (firefox-to-emacs-native-messenger--registry-contains-p m)
                 (cl-return-from result nil)))
             t)))))))
+
+;;;###autoload
+(defun firefox-to-emacs-native-messenger-start ()
+  "Start the bridge listener, binding the Unix-domain socket at FILE-0600.
+
+Pre-bind checks run in the order documented by the plan and Section 8.21:
+
+  1. Idempotency: if a listener process is already recorded, signal
+     `firefox-to-emacs-native-messenger-bad-state' and do not double-bind.
+  2. Verify the cache directory (SEC-0500).
+  3. Verify the tempfile directory (SEC-1100).
+  4. Sweep `tmp_*.txt' from the tempfile directory (PAT-0900).
+  5. Clear the capability registry (REQ-3000 / Section 8.8).
+  6. Run the whitelist-validation sweep (REQ-4100 site 2).
+  7. Probe and delete any stale socket file (PAT-0100).
+
+Only after every pre-bind check succeeds is the listener bound via
+`make-network-process' with the arguments specified in Section 8.17.
+The new listener process is recorded in
+`firefox-to-emacs-native-messenger--listener-process'.
+
+Returns the listener process.  Signals `bad-state' or
+`whitelist-malformed' on pre-bind failure; no socket is created in that
+case."
+  (interactive)
+  (when (and firefox-to-emacs-native-messenger--listener-process
+             (process-live-p
+              firefox-to-emacs-native-messenger--listener-process))
+    (signal 'firefox-to-emacs-native-messenger-bad-state
+            (list "listener already running"
+                  firefox-to-emacs-native-messenger--listener-process)))
+  (firefox-to-emacs-native-messenger--verify-cache-directory)
+  (firefox-to-emacs-native-messenger--verify-tempfile-directory)
+  (firefox-to-emacs-native-messenger--sweep-tempfiles)
+  (firefox-to-emacs-native-messenger--registry-clear-on-start)
+  (firefox-to-emacs-native-messenger--listener-start-whitelist-sweep)
+  (firefox-to-emacs-native-messenger--probe-and-delete-stale-socket
+   firefox-to-emacs-native-messenger-socket-path)
+  (let ((proc (make-network-process
+               :name "firefox-to-emacs-native-messenger-listener"
+               :family 'local
+               :server t
+               :service firefox-to-emacs-native-messenger-socket-path
+               :coding '(binary . binary)
+               :filter-multibyte nil
+               :noquery t)))
+    (setq firefox-to-emacs-native-messenger--listener-process proc)
+    (add-hook 'kill-emacs-hook
+              'firefox-to-emacs-native-messenger--cleanup-on-shutdown)
+    (firefox-to-emacs-native-messenger--log
+     'info "listener started: socket=%s"
+     firefox-to-emacs-native-messenger-socket-path)
+    proc))
+
+;;;###autoload
+(defun firefox-to-emacs-native-messenger-stop ()
+  "Stop the bridge listener and clear its in-memory state.
+
+Tear-down sequence:
+
+  1. If `firefox-to-emacs-native-messenger--listener-process' is nil,
+     return nil immediately as a silent no-op (idempotency).
+  2. If the file at the configured socket path exists and is NOT a real
+     socket (regular file, symlink, fifo, ...), rename it aside before
+     calling `delete-process' so the listener's auto-unlink does not
+     clobber a non-socket replacement; restore the file on cleanup.
+  3. Call `delete-process' on the listener.  For UNIX-domain server
+     processes Emacs unlinks the bound socket file as part of cleanup;
+     if for any reason a real socket lingers, we unlink it explicitly.
+  4. Set the listener process variable to nil.
+  5. Clear the capability registry (REQ-3000 / SEC-1200).
+
+Returns nil."
+  (interactive)
+  (let ((proc firefox-to-emacs-native-messenger--listener-process))
+    (when proc
+      (let* ((path firefox-to-emacs-native-messenger-socket-path)
+             (backup-path nil))
+        (unwind-protect
+            (progn
+              (when (and (file-exists-p path)
+                         (not (firefox-to-emacs-native-messenger--path-is-real-socket-p
+                               path)))
+                (setq backup-path (concat path ".fenm-stop-backup"))
+                (when (file-exists-p backup-path)
+                  (delete-file backup-path))
+                (rename-file path backup-path))
+              (when (process-live-p proc)
+                (delete-process proc))
+              (when (and (file-exists-p path)
+                         (firefox-to-emacs-native-messenger--path-is-real-socket-p
+                          path))
+                (delete-file path)))
+          (when backup-path
+            (when (file-exists-p path)
+              (delete-file path))
+            (rename-file backup-path path))
+          (setq firefox-to-emacs-native-messenger--listener-process nil)
+          (firefox-to-emacs-native-messenger--registry-clear-on-stop)))
+      (firefox-to-emacs-native-messenger--log 'info "listener stopped")))
+  nil)
 
 (provide 'firefox-to-emacs-native-messenger)
 ;;; firefox-to-emacs-native-messenger.el ends here
