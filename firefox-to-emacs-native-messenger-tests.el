@@ -83,6 +83,7 @@
 (require 'ert-x)
 (require 'json)
 (require 'cl-lib)
+(require 'firefox-to-emacs-native-messenger)
 
 (define-error 'firefox-to-emacs-native-messenger-test-fixture-not-found
   "Fixture not found or malformed in PROTOCOL.md")
@@ -573,6 +574,753 @@ the configured reply."
                  "echo hello")))
     (should (= (plist-get result :exit-status) 0))
     (should (equal (plist-get result :stdout) "hello\n"))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-whitelist-defcustom-exists ()
+  "`run-whitelist' is registered as a defcustom with default nil in our group."
+  :tags '(:unit)
+  (should (custom-variable-p 'firefox-to-emacs-native-messenger-run-whitelist))
+  (should (eq (default-value 'firefox-to-emacs-native-messenger-run-whitelist) nil))
+  (should (member '(firefox-to-emacs-native-messenger-run-whitelist custom-variable)
+                  (get 'firefox-to-emacs-native-messenger 'custom-group))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-whitelist-defcustom-exists ()
+  "`read-whitelist' is registered as a defcustom with default nil in our group."
+  :tags '(:unit)
+  (should (custom-variable-p 'firefox-to-emacs-native-messenger-read-whitelist))
+  (should (eq (default-value 'firefox-to-emacs-native-messenger-read-whitelist) nil))
+  (should (member '(firefox-to-emacs-native-messenger-read-whitelist custom-variable)
+                  (get 'firefox-to-emacs-native-messenger 'custom-group))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-temp-registry-cap-defcustom-exists ()
+  "`temp-registry-cap' is registered as a defcustom with default 1024 in our group."
+  :tags '(:unit)
+  (should (custom-variable-p 'firefox-to-emacs-native-messenger-temp-registry-cap))
+  (should (= (default-value 'firefox-to-emacs-native-messenger-temp-registry-cap) 1024))
+  (should (member '(firefox-to-emacs-native-messenger-temp-registry-cap custom-variable)
+                  (get 'firefox-to-emacs-native-messenger 'custom-group))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-capability-registry-init ()
+  "The capability registry exists as an empty `equal'-tested hash table.
+This assertion captures the registry's state at module load.  Other tests
+that mutate the registry MUST restore the empty state via `unwind-protect'."
+  :tags '(:unit)
+  (should (boundp 'firefox-to-emacs-native-messenger--capability-registry))
+  (should (hash-table-p firefox-to-emacs-native-messenger--capability-registry))
+  (should (eq (hash-table-test
+               firefox-to-emacs-native-messenger--capability-registry)
+              'equal))
+  (should (= (hash-table-count
+              firefox-to-emacs-native-messenger--capability-registry)
+             0)))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-error-hierarchy ()
+  "Every child error condition inherits from the bridge's parent error.
+Each child's `error-conditions' list MUST contain the child itself, the
+parent `firefox-to-emacs-native-messenger-error', and the root `error'."
+  :tags '(:unit)
+  (let ((children '(firefox-to-emacs-native-messenger-bad-request
+                    firefox-to-emacs-native-messenger-frame-too-large
+                    firefox-to-emacs-native-messenger-frame-parse-error
+                    firefox-to-emacs-native-messenger-unsupported-command
+                    firefox-to-emacs-native-messenger-handler-error
+                    firefox-to-emacs-native-messenger-bad-state
+                    firefox-to-emacs-native-messenger-whitelist-rejection
+                    firefox-to-emacs-native-messenger-whitelist-malformed)))
+    (should (consp (get 'firefox-to-emacs-native-messenger-error 'error-conditions)))
+    (should (stringp (get 'firefox-to-emacs-native-messenger-error 'error-message)))
+    (dolist (child children)
+      (let ((conds (get child 'error-conditions)))
+        (should conds)
+        (should (memq child conds))
+        (should (memq 'firefox-to-emacs-native-messenger-error conds))
+        (should (memq 'error conds))
+        (should (stringp (get child 'error-message)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-pack-length-produces-4-bytes ()
+  "`pack-length' always returns exactly four bytes (a unibyte string)."
+  :tags '(:unit)
+  (dolist (n '(0 1 65536 16777216 2147483647 4294967295))
+    (let ((bytes (firefox-to-emacs-native-messenger--pack-length n)))
+      (should (stringp bytes))
+      (should-not (multibyte-string-p bytes))
+      (should (= (length bytes) 4)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-pack-length-little-endian ()
+  "`pack-length' uses little-endian byte order per CON-0800."
+  :tags '(:unit)
+  (should (equal (firefox-to-emacs-native-messenger--pack-length 1)
+                 (unibyte-string 1 0 0 0)))
+  (should (equal (firefox-to-emacs-native-messenger--pack-length 256)
+                 (unibyte-string 0 1 0 0)))
+  (should (equal (firefox-to-emacs-native-messenger--pack-length 16777216)
+                 (unibyte-string 0 0 0 1))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-codec-roundtrip ()
+  "Every boundary value round-trips identically through pack+unpack."
+  :tags '(:unit)
+  (dolist (n (list 0 1 65536 16777216 (1- (expt 2 31))
+                   firefox-to-emacs-native-messenger-inbound-frame-cap
+                   (1- (expt 2 32))))
+    (let ((roundtripped (firefox-to-emacs-native-messenger--unpack-length
+                         (firefox-to-emacs-native-messenger--pack-length n))))
+      (should (= roundtripped n)))))
+
+(defmacro firefox-to-emacs-native-messenger-test--with-fresh-log-buffer (&rest body)
+  "Rebind the log buffer name to a unique temp name for BODY; clean up after."
+  (declare (indent 0) (debug (body)))
+  `(let* ((unique-name (generate-new-buffer-name
+                        "*firefox-to-emacs-native-messenger-test-log*"))
+          (firefox-to-emacs-native-messenger-log-buffer-name unique-name))
+     (unwind-protect
+         (progn ,@body)
+       (when (get-buffer unique-name)
+         (kill-buffer unique-name)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-log-creates-buffer-and-writes ()
+  "Logger creates the log buffer when absent and writes the formatted message."
+  :tags '(:unit)
+  (firefox-to-emacs-native-messenger-test--with-fresh-log-buffer
+   (should-not (get-buffer firefox-to-emacs-native-messenger-log-buffer-name))
+   (firefox-to-emacs-native-messenger--log 'info "hello %s" "world")
+   (let ((buf (get-buffer firefox-to-emacs-native-messenger-log-buffer-name)))
+     (should buf)
+     (with-current-buffer buf
+       (should (string-match-p "hello world" (buffer-string)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-log-respects-level ()
+  "Records below the configured level are dropped; equal-or-above are kept."
+  :tags '(:unit)
+  (firefox-to-emacs-native-messenger-test--with-fresh-log-buffer
+   (let ((firefox-to-emacs-native-messenger-log-level 'warn))
+     (firefox-to-emacs-native-messenger--log 'debug "debug-line-marker")
+     (firefox-to-emacs-native-messenger--log 'info "info-line-marker")
+     (firefox-to-emacs-native-messenger--log 'warn "warn-line-marker")
+     (firefox-to-emacs-native-messenger--log 'error "error-line-marker")
+     (let* ((buf (get-buffer firefox-to-emacs-native-messenger-log-buffer-name))
+            (contents (and buf (with-current-buffer buf (buffer-string)))))
+       (should buf)
+       (should-not (string-match-p "debug-line-marker" contents))
+       (should-not (string-match-p "info-line-marker" contents))
+       (should (string-match-p "warn-line-marker" contents))
+       (should (string-match-p "error-line-marker" contents))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-log-never-raises ()
+  "Logger swallows internal errors per GUD-400.
+A bad format directive, a malformed argument list, and an unrecognized
+level symbol all MUST be silently no-oped rather than propagated."
+  :tags '(:unit)
+  (firefox-to-emacs-native-messenger-test--with-fresh-log-buffer
+   (should-not (condition-case _err
+                   (progn
+                     (firefox-to-emacs-native-messenger--log
+                      'info "%d" "not-int")
+                     nil)
+                 (error t)))
+   (should-not (condition-case _err
+                   (progn
+                     (firefox-to-emacs-native-messenger--log
+                      'nonsense-level "x")
+                     nil)
+                 (error t)))
+   (should-not (condition-case _err
+                   (progn
+                     (firefox-to-emacs-native-messenger--log
+                      'info "%s %s" "only-one-arg")
+                     nil)
+                 (error t)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-glob-literal-no-globs ()
+  "A pattern with no glob characters matches only the identical string."
+  :tags '(:unit)
+  (should (firefox-to-emacs-native-messenger--glob-match-p "foo" "foo"))
+  (should-not (firefox-to-emacs-native-messenger--glob-match-p "foo" "foob"))
+  (should-not (firefox-to-emacs-native-messenger--glob-match-p "foo" "afoo"))
+  (should-not (firefox-to-emacs-native-messenger--glob-match-p "foo" "bar"))
+  (should (firefox-to-emacs-native-messenger--glob-match-p
+           "/tmp/file.txt" "/tmp/file.txt"))
+  (should-not (firefox-to-emacs-native-messenger--glob-match-p
+               "/tmp/file.txt" "/tmp/file.txt.bak")))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-glob-star-non-slash ()
+  "`*' matches a (possibly empty) sequence of non-slash characters."
+  :tags '(:unit)
+  (should (firefox-to-emacs-native-messenger--glob-match-p "*" "foo"))
+  (should (firefox-to-emacs-native-messenger--glob-match-p "*.txt" "foo.txt"))
+  (should (firefox-to-emacs-native-messenger--glob-match-p "*.txt" ".txt"))
+  (should-not (firefox-to-emacs-native-messenger--glob-match-p "*" "a/b"))
+  (should-not (firefox-to-emacs-native-messenger--glob-match-p
+               "*.txt" "a/b.txt"))
+  (should (firefox-to-emacs-native-messenger--glob-match-p
+           "/tmp/*.txt" "/tmp/foo.txt"))
+  (should-not (firefox-to-emacs-native-messenger--glob-match-p
+               "/tmp/*.txt" "/tmp/sub/foo.txt")))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-glob-double-star-cross-slash ()
+  "`**' matches any sequence including slashes."
+  :tags '(:unit)
+  (should (firefox-to-emacs-native-messenger--glob-match-p "**" "foo"))
+  (should (firefox-to-emacs-native-messenger--glob-match-p "**" "a/b/c"))
+  (should (firefox-to-emacs-native-messenger--glob-match-p "/tmp/**" "/tmp/foo"))
+  (should (firefox-to-emacs-native-messenger--glob-match-p
+           "/tmp/**" "/tmp/sub/foo"))
+  (should (firefox-to-emacs-native-messenger--glob-match-p
+           "/tmp/**.txt" "/tmp/sub/foo.txt")))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-glob-question-mark ()
+  "`?' matches exactly one non-slash character."
+  :tags '(:unit)
+  (should (firefox-to-emacs-native-messenger--glob-match-p "a?b" "axb"))
+  (should-not (firefox-to-emacs-native-messenger--glob-match-p "a?b" "ab"))
+  (should-not (firefox-to-emacs-native-messenger--glob-match-p "a?b" "axxb"))
+  (should-not (firefox-to-emacs-native-messenger--glob-match-p "a?b" "a/b")))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-glob-full-string-anchored ()
+  "Matches are full-string anchored: no prefix or suffix slop is allowed."
+  :tags '(:unit)
+  (should-not (firefox-to-emacs-native-messenger--glob-match-p "foo" "foobar"))
+  (should-not (firefox-to-emacs-native-messenger--glob-match-p "foo" "barfoo"))
+  (should-not (firefox-to-emacs-native-messenger--glob-match-p
+               "bar" "foobarbaz"))
+  (should (firefox-to-emacs-native-messenger--glob-match-p
+           "/a/b/c" "/a/b/c")))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-glob-empty-edge-cases ()
+  "Empty pattern matches only empty candidate; `*' and `**' match empty."
+  :tags '(:unit)
+  (should (firefox-to-emacs-native-messenger--glob-match-p "" ""))
+  (should-not (firefox-to-emacs-native-messenger--glob-match-p "" "x"))
+  (should-not (firefox-to-emacs-native-messenger--glob-match-p "x" ""))
+  (should (firefox-to-emacs-native-messenger--glob-match-p "*" ""))
+  (should (firefox-to-emacs-native-messenger--glob-match-p "**" "")))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-validate-whitelist-nil-and-empty ()
+  "nil and the empty list are accepted as deny-all for both handler kinds."
+  :tags '(:unit)
+  (dolist (kind '(run read))
+    (should (eq (firefox-to-emacs-native-messenger--validate-whitelist
+                 nil kind)
+                t))
+    (should (eq (firefox-to-emacs-native-messenger--validate-whitelist
+                 '() kind)
+                t))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-validate-whitelist-allow-all ()
+  "(\"*\") is the allow-all sentinel; mixing it with anything else is rejected."
+  :tags '(:unit)
+  (dolist (kind '(run read))
+    (should (eq (firefox-to-emacs-native-messenger--validate-whitelist
+                 '("*") kind)
+                t))
+    (should-error (firefox-to-emacs-native-messenger--validate-whitelist
+                   '("*" "/foo") kind)
+                  :type 'firefox-to-emacs-native-messenger-whitelist-malformed)
+    (should-error (firefox-to-emacs-native-messenger--validate-whitelist
+                   '("/foo" "*") kind)
+                  :type 'firefox-to-emacs-native-messenger-whitelist-malformed)))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-validate-whitelist-non-list-top-level ()
+  "Non-list top-level values (string, vector, integer, symbol) are rejected."
+  :tags '(:unit)
+  (dolist (kind '(run read))
+    (dolist (val '("a-string" [1 2 3] 42 some-symbol))
+      (should-error (firefox-to-emacs-native-messenger--validate-whitelist
+                     val kind)
+                    :type 'firefox-to-emacs-native-messenger-whitelist-malformed))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-validate-whitelist-non-string-entries ()
+  "Lists containing non-strings (numbers, lists, vectors, nil) are rejected."
+  :tags '(:unit)
+  (dolist (kind '(run read))
+    (dolist (val (list '("/ok" 42)
+                       '("/ok" (nested list))
+                       (list "/ok" [1 2])
+                       '("/ok" nil)))
+      (should-error (firefox-to-emacs-native-messenger--validate-whitelist
+                     val kind)
+                    :type 'firefox-to-emacs-native-messenger-whitelist-malformed))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-validate-whitelist-empty-string ()
+  "Empty-string entries are rejected for both handler kinds."
+  :tags '(:unit)
+  (dolist (kind '(run read))
+    (should-error (firefox-to-emacs-native-messenger--validate-whitelist
+                   '("") kind)
+                  :type 'firefox-to-emacs-native-messenger-whitelist-malformed)
+    (should-error (firefox-to-emacs-native-messenger--validate-whitelist
+                   '("/ok" "") kind)
+                  :type 'firefox-to-emacs-native-messenger-whitelist-malformed)))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-validate-whitelist-control-chars ()
+  "Entries containing newline or null bytes are rejected."
+  :tags '(:unit)
+  (dolist (kind '(run read))
+    (should-error (firefox-to-emacs-native-messenger--validate-whitelist
+                   '("/contains\nnewline") kind)
+                  :type 'firefox-to-emacs-native-messenger-whitelist-malformed)
+    (should-error (firefox-to-emacs-native-messenger--validate-whitelist
+                   (list (concat "/contains" (string 0) "null")) kind)
+                  :type 'firefox-to-emacs-native-messenger-whitelist-malformed)))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-validate-whitelist-read-valid ()
+  "Read entries: absolute paths, glob paths, and the literal <TEMP-PATH> token."
+  :tags '(:unit)
+  (should (eq (firefox-to-emacs-native-messenger--validate-whitelist
+               '("/etc/hosts"
+                 "/home/u/*.txt"
+                 "<TEMP-PATH>"
+                 "/srv/**.txt"
+                 "/single?char")
+               'read)
+              t)))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-validate-whitelist-read-rejects-relative ()
+  "Read entries that are neither absolute paths nor the <TEMP-PATH> token are rejected."
+  :tags '(:unit)
+  (should-error (firefox-to-emacs-native-messenger--validate-whitelist
+                 '("foo/bar") 'read)
+                :type 'firefox-to-emacs-native-messenger-whitelist-malformed)
+  (should-error (firefox-to-emacs-native-messenger--validate-whitelist
+                 '("./relative.txt") 'read)
+                :type 'firefox-to-emacs-native-messenger-whitelist-malformed)
+  (should-error (firefox-to-emacs-native-messenger--validate-whitelist
+                 '("noslashes") 'read)
+                :type 'firefox-to-emacs-native-messenger-whitelist-malformed)
+  (should-error (firefox-to-emacs-native-messenger--validate-whitelist
+                 '("<temp-path>") 'read)
+                :type 'firefox-to-emacs-native-messenger-whitelist-malformed))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-validate-whitelist-run-valid ()
+  "Run entries: literal commands and <TEMP-PATH>-templated commands accepted."
+  :tags '(:unit)
+  (should (eq (firefox-to-emacs-native-messenger--validate-whitelist
+               '("emacsclient <TEMP-PATH>"
+                 "rm -f '<TEMP-PATH>'"
+                 "ls /home"
+                 "cp <TEMP-PATH> <TEMP-PATH>"
+                 "a<TEMP-PATH>b<TEMP-PATH>c")
+               'run)
+              t)))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-validate-whitelist-run-typo-guard ()
+  "Run entries with any non-<TEMP-PATH> <...> token are rejected (typo guard)."
+  :tags '(:unit)
+  (should-error (firefox-to-emacs-native-messenger--validate-whitelist
+                 '("rm <TMP-PATH>") 'run)
+                :type 'firefox-to-emacs-native-messenger-whitelist-malformed)
+  (should-error (firefox-to-emacs-native-messenger--validate-whitelist
+                 '("rm <temp-path>") 'run)
+                :type 'firefox-to-emacs-native-messenger-whitelist-malformed)
+  (should-error (firefox-to-emacs-native-messenger--validate-whitelist
+                 '("rm <FOO>") 'run)
+                :type 'firefox-to-emacs-native-messenger-whitelist-malformed))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-validate-whitelist-run-adjacent-markers ()
+  "Run entries with two adjacent <TEMP-PATH> markers are rejected."
+  :tags '(:unit)
+  (should-error (firefox-to-emacs-native-messenger--validate-whitelist
+                 '("<TEMP-PATH><TEMP-PATH>") 'run)
+                :type 'firefox-to-emacs-native-messenger-whitelist-malformed)
+  (should-error (firefox-to-emacs-native-messenger--validate-whitelist
+                 '("prefix <TEMP-PATH><TEMP-PATH> suffix") 'run)
+                :type 'firefox-to-emacs-native-messenger-whitelist-malformed)
+  (should (eq (firefox-to-emacs-native-messenger--validate-whitelist
+               '("a<TEMP-PATH>b<TEMP-PATH>c") 'run)
+              t)))
+
+(defmacro firefox-to-emacs-native-messenger-test--with-saved-whitelists (&rest body)
+  "Save the bridge's whitelist defcustom values, run BODY, restore on exit.
+Restoration uses `setq', which re-invokes the watcher; the originally
+captured values are therefore expected to be well-formed."
+  (declare (indent 0) (debug (body)))
+  `(let ((orig-run firefox-to-emacs-native-messenger-run-whitelist)
+         (orig-read firefox-to-emacs-native-messenger-read-whitelist))
+     (unwind-protect
+         (progn ,@body)
+       (setq firefox-to-emacs-native-messenger-run-whitelist orig-run)
+       (setq firefox-to-emacs-native-messenger-read-whitelist orig-read))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-watcher-accepts-wellformed-setq ()
+  "Setq of a well-formed whitelist value succeeds without raising."
+  :tags '(:unit)
+  (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+   (setq firefox-to-emacs-native-messenger-run-whitelist nil)
+   (should (eq firefox-to-emacs-native-messenger-run-whitelist nil))
+   (setq firefox-to-emacs-native-messenger-run-whitelist
+         '("emacsclient <TEMP-PATH>"))
+   (should (equal firefox-to-emacs-native-messenger-run-whitelist
+                  '("emacsclient <TEMP-PATH>")))
+   (setq firefox-to-emacs-native-messenger-run-whitelist '("*"))
+   (should (equal firefox-to-emacs-native-messenger-run-whitelist '("*")))
+   (setq firefox-to-emacs-native-messenger-read-whitelist
+         '("<TEMP-PATH>" "/etc/hosts"))
+   (should (equal firefox-to-emacs-native-messenger-read-whitelist
+                  '("<TEMP-PATH>" "/etc/hosts")))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-watcher-rejects-malformed-setq ()
+  "Setq of a malformed whitelist value signals `whitelist-malformed' and
+leaves the variable's prior value unchanged."
+  :tags '(:unit)
+  (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+   (setq firefox-to-emacs-native-messenger-run-whitelist
+         '("emacsclient <TEMP-PATH>"))
+   (setq firefox-to-emacs-native-messenger-read-whitelist '("<TEMP-PATH>"))
+   (should-error
+    (setq firefox-to-emacs-native-messenger-run-whitelist
+          '("rm <TMP-PATH>"))
+    :type 'firefox-to-emacs-native-messenger-whitelist-malformed)
+   (should (equal firefox-to-emacs-native-messenger-run-whitelist
+                  '("emacsclient <TEMP-PATH>")))
+   (should-error
+    (setq firefox-to-emacs-native-messenger-read-whitelist
+          '("relative/path"))
+    :type 'firefox-to-emacs-native-messenger-whitelist-malformed)
+   (should (equal firefox-to-emacs-native-messenger-read-whitelist
+                  '("<TEMP-PATH>")))
+   (should-error
+    (setq firefox-to-emacs-native-messenger-run-whitelist '("*" "/foo"))
+    :type 'firefox-to-emacs-native-messenger-whitelist-malformed)
+   (should (equal firefox-to-emacs-native-messenger-run-whitelist
+                  '("emacsclient <TEMP-PATH>")))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-watcher-idempotent-registration ()
+  "Re-loading the production module does not stack additional watchers.
+Watchers MUST be installed via a named function and registered idempotently."
+  :tags '(:unit)
+  (let* ((before-run (get-variable-watchers
+                      'firefox-to-emacs-native-messenger-run-whitelist))
+         (before-read (get-variable-watchers
+                       'firefox-to-emacs-native-messenger-read-whitelist)))
+    (load (locate-library "firefox-to-emacs-native-messenger")
+          nil 'nomessage)
+    (let ((after-run (get-variable-watchers
+                      'firefox-to-emacs-native-messenger-run-whitelist))
+          (after-read (get-variable-watchers
+                       'firefox-to-emacs-native-messenger-read-whitelist)))
+      (should (equal before-run after-run))
+      (should (equal before-read after-read))
+      (should (= (length after-run) 1))
+      (should (= (length after-read) 1)))))
+
+(defmacro firefox-to-emacs-native-messenger-test--with-saved-registry-cap (&rest body)
+  "Save `temp-registry-cap', run BODY, restore on exit via setq."
+  (declare (indent 0) (debug (body)))
+  `(let ((orig firefox-to-emacs-native-messenger-temp-registry-cap))
+     (unwind-protect
+         (progn ,@body)
+       (setq firefox-to-emacs-native-messenger-temp-registry-cap orig))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-set-slot-wired ()
+  "The :set slot is wired on each whitelist and the registry-cap defcustom."
+  :tags '(:unit)
+  (should (get 'firefox-to-emacs-native-messenger-run-whitelist 'custom-set))
+  (should (get 'firefox-to-emacs-native-messenger-read-whitelist 'custom-set))
+  (should (get 'firefox-to-emacs-native-messenger-temp-registry-cap 'custom-set)))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-customize-whitelist-wellformed ()
+  "`customize-set-variable' of a well-formed whitelist value succeeds."
+  :tags '(:unit)
+  (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+   (customize-set-variable 'firefox-to-emacs-native-messenger-run-whitelist
+                            '("emacsclient <TEMP-PATH>"))
+   (should (equal firefox-to-emacs-native-messenger-run-whitelist
+                  '("emacsclient <TEMP-PATH>")))
+   (customize-set-variable 'firefox-to-emacs-native-messenger-read-whitelist
+                            '("<TEMP-PATH>"))
+   (should (equal firefox-to-emacs-native-messenger-read-whitelist
+                  '("<TEMP-PATH>")))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-customize-whitelist-malformed ()
+  "`customize-set-variable' of malformed value raises and leaves value unchanged."
+  :tags '(:unit)
+  (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+   (setq firefox-to-emacs-native-messenger-run-whitelist
+         '("emacsclient <TEMP-PATH>"))
+   (setq firefox-to-emacs-native-messenger-read-whitelist '("<TEMP-PATH>"))
+   (should-error
+    (customize-set-variable
+     'firefox-to-emacs-native-messenger-run-whitelist '("rm <TMP-PATH>"))
+    :type 'firefox-to-emacs-native-messenger-whitelist-malformed)
+   (should (equal firefox-to-emacs-native-messenger-run-whitelist
+                  '("emacsclient <TEMP-PATH>")))
+   (should-error
+    (customize-set-variable
+     'firefox-to-emacs-native-messenger-read-whitelist '("relative"))
+    :type 'firefox-to-emacs-native-messenger-whitelist-malformed)
+   (should (equal firefox-to-emacs-native-messenger-read-whitelist
+                  '("<TEMP-PATH>")))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-customize-registry-cap-wellformed ()
+  "`customize-set-variable' of a positive integer for the cap succeeds."
+  :tags '(:unit)
+  (firefox-to-emacs-native-messenger-test--with-saved-registry-cap
+   (customize-set-variable 'firefox-to-emacs-native-messenger-temp-registry-cap 2048)
+   (should (= firefox-to-emacs-native-messenger-temp-registry-cap 2048))
+   (customize-set-variable 'firefox-to-emacs-native-messenger-temp-registry-cap 1)
+   (should (= firefox-to-emacs-native-messenger-temp-registry-cap 1))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-customize-registry-cap-malformed ()
+  "Non-positive integers and non-integers are rejected by the cap's :set slot."
+  :tags '(:unit)
+  (firefox-to-emacs-native-messenger-test--with-saved-registry-cap
+   (setq firefox-to-emacs-native-messenger-temp-registry-cap 1024)
+   (should-error
+    (customize-set-variable
+     'firefox-to-emacs-native-messenger-temp-registry-cap -1))
+   (should (= firefox-to-emacs-native-messenger-temp-registry-cap 1024))
+   (should-error
+    (customize-set-variable
+     'firefox-to-emacs-native-messenger-temp-registry-cap 0))
+   (should (= firefox-to-emacs-native-messenger-temp-registry-cap 1024))
+   (should-error
+    (customize-set-variable
+     'firefox-to-emacs-native-messenger-temp-registry-cap "string"))
+   (should (= firefox-to-emacs-native-messenger-temp-registry-cap 1024))))
+
+(defmacro firefox-to-emacs-native-messenger-test--with-stub-registry (registered-paths &rest body)
+  "Stub `--registry-contains-p' to accept only REGISTERED-PATHS during BODY.
+REGISTERED-PATHS is a list of absolute path strings."
+  (declare (indent 1) (debug (form body)))
+  `(cl-letf (((symbol-function
+               'firefox-to-emacs-native-messenger--registry-contains-p)
+              (let ((paths ,registered-paths))
+                (lambda (p) (and (member p paths) t)))))
+     ,@body))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-command-gate-literal-no-markers ()
+  "Entry with zero markers accepts iff candidate equals entry byte-for-byte."
+  :tags '(:unit)
+  (firefox-to-emacs-native-messenger-test--with-stub-registry '()
+    (should (firefox-to-emacs-native-messenger--command-gate-match-p
+             "ls /home" "ls /home"))
+    (should-not (firefox-to-emacs-native-messenger--command-gate-match-p
+                 "ls /home" "ls /home "))
+    (should-not (firefox-to-emacs-native-messenger--command-gate-match-p
+                 "ls /home" "ls /etc"))
+    (should-not (firefox-to-emacs-native-messenger--command-gate-match-p
+                 "ls /home" "ls /home extra"))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-command-gate-single-marker ()
+  "Single-marker entry matches iff prefix/suffix and registry hit are all true."
+  :tags '(:unit)
+  (firefox-to-emacs-native-messenger-test--with-stub-registry
+      '("/tmp/firefox-to-emacs-native-messenger-tempfiles-1000/tmp_x.txt")
+    (should (firefox-to-emacs-native-messenger--command-gate-match-p
+             "emacsclient <TEMP-PATH>"
+             "emacsclient /tmp/firefox-to-emacs-native-messenger-tempfiles-1000/tmp_x.txt"))
+    (should-not (firefox-to-emacs-native-messenger--command-gate-match-p
+                 "emacsclient <TEMP-PATH>"
+                 "emacsclient /other/path"))
+    (should-not (firefox-to-emacs-native-messenger--command-gate-match-p
+                 "emacsclient <TEMP-PATH>"
+                 "vim /tmp/firefox-to-emacs-native-messenger-tempfiles-1000/tmp_x.txt"))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-command-gate-quoted-suffix ()
+  "Entry with a non-empty trailing literal matches when suffix is present."
+  :tags '(:unit)
+  (firefox-to-emacs-native-messenger-test--with-stub-registry
+      '("/tmp/foo")
+    (should (firefox-to-emacs-native-messenger--command-gate-match-p
+             "rm -f '<TEMP-PATH>'" "rm -f '/tmp/foo'"))
+    (should-not (firefox-to-emacs-native-messenger--command-gate-match-p
+                 "rm -f '<TEMP-PATH>'" "rm -f '/tmp/foo' extra"))
+    (should-not (firefox-to-emacs-native-messenger--command-gate-match-p
+                 "rm -f '<TEMP-PATH>'" "rm -f /tmp/foo"))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-command-gate-trailing-bytes-reject ()
+  "Trailing bytes after the matched template reject the candidate."
+  :tags '(:unit)
+  (firefox-to-emacs-native-messenger-test--with-stub-registry
+      '("/tmp/foo")
+    (should-not (firefox-to-emacs-native-messenger--command-gate-match-p
+                 "emacsclient <TEMP-PATH>"
+                 "emacsclient /tmp/foo ;rm -rf ~"))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-command-gate-multi-marker-first-occurrence ()
+  "Multi-marker entry uses first-occurrence search for interior literals."
+  :tags '(:unit)
+  (firefox-to-emacs-native-messenger-test--with-stub-registry
+      '("/a" "/b")
+    (should (firefox-to-emacs-native-messenger--command-gate-match-p
+             "cp <TEMP-PATH> <TEMP-PATH>" "cp /a /b"))
+    (should-not (firefox-to-emacs-native-messenger--command-gate-match-p
+                 "cp <TEMP-PATH> <TEMP-PATH>" "cp /a /b /c")))
+  (firefox-to-emacs-native-messenger-test--with-stub-registry
+      '("/b /c")
+    (should-not (firefox-to-emacs-native-messenger--command-gate-match-p
+                 "cp <TEMP-PATH> <TEMP-PATH>" "cp /a /b /c"))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-command-gate-marker-missing-from-registry ()
+  "An extracted marker substring not in the registry rejects."
+  :tags '(:unit)
+  (firefox-to-emacs-native-messenger-test--with-stub-registry '()
+    (should-not (firefox-to-emacs-native-messenger--command-gate-match-p
+                 "emacsclient <TEMP-PATH>" "emacsclient /tmp/foo"))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-command-gate-empty-marker-rejects ()
+  "A marker that matches zero bytes rejects."
+  :tags '(:unit)
+  (firefox-to-emacs-native-messenger-test--with-stub-registry '("")
+    (should-not (firefox-to-emacs-native-messenger--command-gate-match-p
+                 "emacsclient <TEMP-PATH>" "emacsclient "))
+    (should-not (firefox-to-emacs-native-messenger--command-gate-match-p
+                 "rm -f '<TEMP-PATH>'" "rm -f ''"))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-command-gate-multi-marker-missing-interior ()
+  "Multi-marker entry rejects when the interior literal is missing in candidate."
+  :tags '(:unit)
+  (firefox-to-emacs-native-messenger-test--with-stub-registry '("/a" "/b")
+    (should-not (firefox-to-emacs-native-messenger--command-gate-match-p
+                 "cp <TEMP-PATH> <TEMP-PATH>" "cp/a/b"))))
+
+(defmacro firefox-to-emacs-native-messenger-test--with-fresh-registry (&rest body)
+  "Save the capability registry, run BODY, clear and restore on exit."
+  (declare (indent 0) (debug (body)))
+  `(let ((saved-entries
+          (let (acc)
+            (maphash
+             (lambda (k v) (push (cons k v) acc))
+             firefox-to-emacs-native-messenger--capability-registry)
+            acc)))
+     (clrhash firefox-to-emacs-native-messenger--capability-registry)
+     (unwind-protect
+         (progn ,@body)
+       (clrhash firefox-to-emacs-native-messenger--capability-registry)
+       (dolist (e saved-entries)
+         (puthash (car e) (cdr e)
+                  firefox-to-emacs-native-messenger--capability-registry)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-registry-register-stores-identity ()
+  "`register' adds an entry whose value plist records dev/inode/uid."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-fresh-registry
+   (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+     (let ((path (expand-file-name "f.txt" dir)))
+       (with-temp-file path (insert "x"))
+       (firefox-to-emacs-native-messenger--registry-register path)
+       (let ((value (gethash path
+                             firefox-to-emacs-native-messenger--capability-registry))
+             (attrs (file-attributes path)))
+         (should (plistp value))
+         (should (equal (plist-get value :dev)
+                        (file-attribute-device-number attrs)))
+         (should (equal (plist-get value :inode)
+                        (file-attribute-inode-number attrs)))
+         (should (equal (plist-get value :uid)
+                        (file-attribute-user-id attrs))))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-registry-contains-p-hit ()
+  "`contains-p' returns t for a registered path that still matches identity."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-fresh-registry
+   (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+     (let ((path (expand-file-name "f.txt" dir)))
+       (with-temp-file path (insert "x"))
+       (firefox-to-emacs-native-messenger--registry-register path)
+       (should (firefox-to-emacs-native-messenger--registry-contains-p path))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-registry-contains-p-not-registered ()
+  "`contains-p' returns nil for unregistered paths."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-fresh-registry
+   (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+     (let ((path (expand-file-name "f.txt" dir)))
+       (with-temp-file path (insert "x"))
+       (should-not (firefox-to-emacs-native-messenger--registry-contains-p path))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-registry-contains-p-prunes-missing ()
+  "`contains-p' prunes and returns nil when the file is gone."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-fresh-registry
+   (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+     (let ((path (expand-file-name "f.txt" dir)))
+       (with-temp-file path (insert "x"))
+       (firefox-to-emacs-native-messenger--registry-register path)
+       (delete-file path)
+       (should-not (firefox-to-emacs-native-messenger--registry-contains-p path))
+       (should-not (gethash path
+                            firefox-to-emacs-native-messenger--capability-registry))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-registry-contains-p-prunes-dev-inode-mismatch ()
+  "`contains-p' prunes when dev/inode changes (file replaced via rename)."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-fresh-registry
+   (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+     (let ((path (expand-file-name "f.txt" dir))
+           (replacement (expand-file-name "g.txt" dir)))
+       (with-temp-file path (insert "x"))
+       (firefox-to-emacs-native-messenger--registry-register path)
+       (with-temp-file replacement (insert "y"))
+       (rename-file replacement path t)
+       (should-not (firefox-to-emacs-native-messenger--registry-contains-p path))
+       (should-not (gethash path
+                            firefox-to-emacs-native-messenger--capability-registry))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-registry-contains-p-prunes-symlink ()
+  "`contains-p' prunes when the registered path becomes a symlink."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-fresh-registry
+   (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+     (let ((path (expand-file-name "f.txt" dir))
+           (target (expand-file-name "tgt.txt" dir)))
+       (with-temp-file path (insert "x"))
+       (with-temp-file target (insert "t"))
+       (firefox-to-emacs-native-messenger--registry-register path)
+       (delete-file path)
+       (make-symbolic-link target path)
+       (should-not (firefox-to-emacs-native-messenger--registry-contains-p path))
+       (should-not (gethash path
+                            firefox-to-emacs-native-messenger--capability-registry))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-registry-contains-p-prunes-directory ()
+  "`contains-p' prunes when the registered path becomes a directory."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-fresh-registry
+   (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+     (let ((path (expand-file-name "f.txt" dir)))
+       (with-temp-file path (insert "x"))
+       (firefox-to-emacs-native-messenger--registry-register path)
+       (delete-file path)
+       (make-directory path)
+       (should-not (firefox-to-emacs-native-messenger--registry-contains-p path))
+       (should-not (gethash path
+                            firefox-to-emacs-native-messenger--capability-registry))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-registry-clear-all ()
+  "`clear-all' empties the registry."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-fresh-registry
+   (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+     (let ((p1 (expand-file-name "f1.txt" dir))
+           (p2 (expand-file-name "f2.txt" dir)))
+       (with-temp-file p1 (insert "x"))
+       (with-temp-file p2 (insert "y"))
+       (firefox-to-emacs-native-messenger--registry-register p1)
+       (firefox-to-emacs-native-messenger--registry-register p2)
+       (should (= (hash-table-count
+                   firefox-to-emacs-native-messenger--capability-registry)
+                  2))
+       (firefox-to-emacs-native-messenger--registry-clear-all)
+       (should (= (hash-table-count
+                   firefox-to-emacs-native-messenger--capability-registry)
+                  0))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-registry-prune-all ()
+  "`prune-all' removes only missing/mismatched entries; preserves valid ones."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-fresh-registry
+   (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+     (let ((p1 (expand-file-name "f1.txt" dir))
+           (p2 (expand-file-name "f2.txt" dir)))
+       (with-temp-file p1 (insert "x"))
+       (with-temp-file p2 (insert "y"))
+       (firefox-to-emacs-native-messenger--registry-register p1)
+       (firefox-to-emacs-native-messenger--registry-register p2)
+       (delete-file p1)
+       (firefox-to-emacs-native-messenger--registry-prune-all)
+       (should-not (gethash p1
+                            firefox-to-emacs-native-messenger--capability-registry))
+       (should (gethash p2
+                        firefox-to-emacs-native-messenger--capability-registry))))))
 
 (provide 'firefox-to-emacs-native-messenger-tests)
 ;;; firefox-to-emacs-native-messenger-tests.el ends here
