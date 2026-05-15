@@ -165,6 +165,17 @@ Verified to exist at mode 0700 on every listener start.")
                     firefox-to-emacs-native-messenger-cache-directory)
   "Side-channel PID file at FILE-0700, written by the wrapper.")
 
+(defconst firefox-to-emacs-native-messenger-version
+  "0.3.7"
+  "Version string claimed by the bridge in `version' handler responses.
+
+Pinned to the lowest upstream `native_main.nim' VERSION whose request
+and response contract is fully implemented for the five v2 handlers in
+scope, constrained to be at least the upstream
+`requiredNativeMessengerVersion' that gates `Native.getrcpath' per
+Tridactyl `src/lib/native.ts'.  See PROTOCOL.md Section 8 for the
+audit reasoning behind the literal value.")
+
 (defconst firefox-to-emacs-native-messenger-rcpath-candidates
   (list
    (expand-file-name "tridactyl/tridactylrc" (xdg-config-home))
@@ -1561,6 +1572,410 @@ the logger at info level and otherwise ignored."
     (firefox-to-emacs-native-messenger--log
      'info "listener event: %s"
      (if (stringp message) message (format "%S" message))))))
+
+
+;;;; ============================================================
+;;;; Phase 0700: handlers, gates, and supporting helpers.
+;;;; ============================================================
+
+(defun firefox-to-emacs-native-messenger--tramp-guard (path)
+  "Reject PATH when it is a TRAMP/remote path per SEC-0100.
+
+`file-remote-p' is the authoritative locality check; any non-nil return
+indicates a remote/TRAMP path.  The guard signals
+`firefox-to-emacs-native-messenger-bad-request' on rejection so that
+callers (the path-expansion helper, the `read' handler, the
+`getconfigpath' candidate walker) can translate the signal into the
+fixture-defined generic error wording (\"remote paths not permitted\").
+
+Returns PATH unchanged on success; the return value allows callers to
+chain the guard inline with the path argument (e.g.,
+`(setq path (--tramp-guard path))')."
+  (when (file-remote-p path)
+    (signal 'firefox-to-emacs-native-messenger-bad-request
+            (list "remote paths not permitted" path)))
+  path)
+
+(defun firefox-to-emacs-native-messenger--expand-path (path)
+  "Expand PATH per the PAT-0400 path-expansion helper sequence.
+
+The sequence enforces TRAMP/remote-path rejection at two stages, with
+env-var substitution and tilde/relative expansion in between, exactly
+as documented in plan Section 8.16:
+
+  1. First TRAMP guard on PATH as supplied by the caller.
+  2. Let-bind `default-directory' to the user's home directory so
+     relative paths and ~ references resolve against a known-local
+     base.
+  3. `substitute-env-vars' with WHEN-UNDEFINED set to t (Emacs 30+):
+     set variables are expanded to their values; unset references
+     pass through literally (the t value is the documented
+     keep-original passthrough behavior).
+  4. `expand-file-name' to canonicalize the path.
+  5. Second TRAMP guard on the expanded path (catches the case where
+     a local raw input expands into a TRAMP path via env-var
+     substitution).
+
+Returns the expanded canonical local path on success.  Signals
+`firefox-to-emacs-native-messenger-bad-request' at either guard
+boundary, propagating to the caller (typically the `read' handler or
+the `getconfigpath' candidate walker) for translation into the
+generic error response."
+  (firefox-to-emacs-native-messenger--tramp-guard path)
+  (let* ((default-directory (expand-file-name "~/"))
+         (substituted (substitute-env-vars path t))
+         (expanded (expand-file-name substituted)))
+    (firefox-to-emacs-native-messenger--tramp-guard expanded)
+    expanded))
+
+(defun firefox-to-emacs-native-messenger--read-gate-match-p (expanded-path)
+  "Return non-nil iff EXPANDED-PATH is permitted by the read-whitelist.
+
+Re-validates `firefox-to-emacs-native-messenger-read-whitelist' per
+PAT-1100 site 3 (the per-gate-check site) before consulting entries.
+On malformed defcustom values the shared validator signals
+`firefox-to-emacs-native-messenger-whitelist-malformed'; the `read'
+handler catches the signal and produces the generic error response.
+
+Whitelist semantics per REQ-2700, REQ-3700, REQ-3800:
+
+  - nil or the empty list: deny-all (return nil).
+  - `(\"*\")': allow-all sentinel (return t).
+  - otherwise: each entry is one of:
+      * the literal token `<TEMP-PATH>': match iff EXPANDED-PATH is in
+        the capability registry per
+        `firefox-to-emacs-native-messenger--registry-contains-p'.
+      * any other absolute-path string: match per
+        `firefox-to-emacs-native-messenger--glob-match-p' (literal
+        paths are globs without metacharacters, so the same matcher
+        covers both cases).
+
+The function reads the whitelist fresh on every call per REQ-4200;
+no caching is performed."
+  (let ((whitelist firefox-to-emacs-native-messenger-read-whitelist))
+    (firefox-to-emacs-native-messenger--validate-whitelist whitelist 'read)
+    (cond
+      ((null whitelist) nil)
+      ((equal whitelist '("*")) t)
+      (t
+        (cl-block found
+          (dolist (entry whitelist)
+            (when (firefox-to-emacs-native-messenger--read-entry-match-p
+                    entry expanded-path)
+              (cl-return-from found t)))
+          nil)))))
+
+(defun firefox-to-emacs-native-messenger--read-entry-match-p (entry path)
+  "Return non-nil iff ENTRY matches PATH under read-whitelist semantics.
+
+ENTRY is one of the validator-accepted forms: the literal token
+`<TEMP-PATH>' (consults the capability registry), or an absolute path
+with or without glob metacharacters (matched via the bridge's glob
+matcher per REQ-2900).  The validator at PAT-1100 sites 1-3 guarantees
+ENTRY has one of those shapes; this helper is for the MATCH step only,
+not for re-validation."
+  (cond
+    ((equal entry "<TEMP-PATH>")
+      (firefox-to-emacs-native-messenger--registry-contains-p path))
+    (t
+      (firefox-to-emacs-native-messenger--glob-match-p entry path))))
+
+(defun firefox-to-emacs-native-messenger--version-handler (_client _request)
+  "Return the wire response for the `version' cmd per PROTOCOL.md Section 8.
+
+CLIENT and REQUEST are accepted for dispatch-table uniformity but
+neither is consulted: the `version' handler reads no request fields
+and produces a pure function of the bridge's version defconst.  The
+handler is ungated (no whitelist applies) per REQ-1600/1900."
+  (list (cons 'cmd "version")
+        (cons 'version firefox-to-emacs-native-messenger-version)
+        (cons 'code 0)))
+
+(defun firefox-to-emacs-native-messenger--sanitize-temp-prefix (prefix)
+  "Sanitize PREFIX for use in a `make-temp-file' template per upstream rules.
+
+The sanitization mirrors upstream `native_main.nim's filename
+sanitization for the `temp' handler (REQ-1100 / SEC-1100):
+
+  1. Coerce non-string PREFIX (nil, integer, etc.) to the empty
+     string before any substring operations.
+  2. Lowercase ASCII letters via `downcase'.
+  3. Retain only ASCII letters, digits, and the dot character;
+     replace every other character with the empty string.
+  4. Collapse any run of two or more consecutive dots into a single
+     dot.
+
+Returns the sanitized prefix string; an empty input yields the empty
+string.  Callers integrating with `make-temp-file' append a fixed
+literal suffix so a degenerate empty prefix still yields a valid
+template."
+  (if (not (stringp prefix))
+      ""
+    (let* ((lower (downcase prefix))
+           (stripped (replace-regexp-in-string "[^a-z0-9.]" "" lower))
+           (collapsed (replace-regexp-in-string "\\.\\.+" "." stripped)))
+      collapsed)))
+
+(defun firefox-to-emacs-native-messenger--temp-handler (_client request)
+  "Implement the `temp' cmd: write a tempfile and register it for later access.
+
+Ordering per TASK-14800 is non-negotiable:
+
+  1. Field validation.  Request MUST carry a string `content' field;
+     missing, null, or non-string `content' returns the generic error
+     response WITHOUT creating any tempfile.  `prefix' is optional and
+     defaults to the empty string; non-string prefix is coerced to
+     empty by the sanitizer.
+  2. Registry-cap preflight per REQ-3000 / Section 8.8: if the registry
+     count is at or above
+     `firefox-to-emacs-native-messenger-temp-registry-cap', invoke
+     `--registry-prune-all' to drop stale entries.  If still at or
+     above the cap, return the generic error without creating a
+     tempfile.
+  3. Build the `make-temp-file' template: prefix = FILE-1600 + `tmp_'
+     + sanitized + `_'; suffix = `.txt'; no DIR-FLAG (regular file).
+  4. Atomically chmod the new file to 0600.
+  5. Write `content' to the file.  Any signal from steps 4-7 (chmod,
+     write, registration) triggers cleanup: the just-created tempfile
+     is unlinked and the generic error response is returned without
+     registering.
+  6. Register the path in the capability registry with its current
+     `file-attributes' identity.
+  7. Return the success response per the `temp-success' fixture:
+     `((cmd . \"temp\") (content . PATH) (code . 0))'.
+
+CLIENT is accepted for dispatch-table uniformity and not consulted.
+The handler is ungated per REQ-2600: any well-formed `temp' request
+succeeds regardless of the per-handler whitelists.  The security
+boundary is FILE-1600's mode 0700 daemon-UID-owned directory and the
+capability-registry cap."
+  (let ((content-cell (assq 'content request)))
+    (cond
+      ((or (null content-cell) (not (stringp (cdr content-cell))))
+        (firefox-to-emacs-native-messenger--build-error-response
+          "missing required field: content"))
+      (t
+        (firefox-to-emacs-native-messenger--temp-handler--proceed
+          (cdr content-cell)
+          (cdr-safe (assq 'prefix request)))))))
+
+(defun firefox-to-emacs-native-messenger--temp-handler--proceed
+    (content prefix)
+  "Internal continuation of `--temp-handler' after field validation succeeded.
+
+Implements the registry-cap preflight (REQ-3000), tempfile creation,
+chmod-then-write sequence with cleanup-on-failure, and capability
+registration.  Returns the wire response alist."
+  (let* ((registry firefox-to-emacs-native-messenger--capability-registry)
+         (cap firefox-to-emacs-native-messenger-temp-registry-cap))
+    (when (>= (hash-table-count registry) cap)
+      (firefox-to-emacs-native-messenger--registry-prune-all))
+    (cond
+      ((>= (hash-table-count registry) cap)
+        (firefox-to-emacs-native-messenger--build-error-response
+          "temp registry cap exceeded"))
+      (t
+        (firefox-to-emacs-native-messenger--temp-handler--create
+          content prefix)))))
+
+(defun firefox-to-emacs-native-messenger--temp-handler--create
+    (content prefix)
+  "Create the tempfile, chmod/write/register, and build the success response.
+
+On any error during chmod, write, or registration, unlinks the
+just-created tempfile and returns the generic error response.  This
+helper assumes the field validation (string content) and the
+registry-cap preflight have already passed."
+  (let* ((sanitized
+           (firefox-to-emacs-native-messenger--sanitize-temp-prefix prefix))
+         (template
+           (concat firefox-to-emacs-native-messenger-tempfile-directory
+                   "tmp_" sanitized "_"))
+         (path (make-temp-file template nil ".txt"))
+         (succeeded nil))
+    (unwind-protect
+        (condition-case err
+            (progn
+              (set-file-modes path #o600)
+              (let ((coding-system-for-write 'binary))
+                (write-region content nil path nil 'no-message))
+              (firefox-to-emacs-native-messenger--registry-register path)
+              (setq succeeded t)
+              (list (cons 'cmd "temp")
+                    (cons 'content path)
+                    (cons 'code 0)))
+          (error
+            (firefox-to-emacs-native-messenger--build-error-response
+              (format "temp handler error: %s"
+                      (error-message-string err)))))
+      (unless succeeded
+        (when (file-exists-p path)
+          (ignore-errors (delete-file path)))))))
+
+(defun firefox-to-emacs-native-messenger--find-rcpath ()
+  "Return the first existing candidate in `--rcpath-candidates' or nil.
+
+The walker iterates
+`firefox-to-emacs-native-messenger-rcpath-candidates' in upstream-defined
+order (per PROTOCOL.md Section 17).  For each candidate:
+
+  1. Runs the TRAMP guard (PAT-0400 step 1) defensively per SEC-1300.
+     A TRAMP-shaped candidate signals `bad-request' immediately; this
+     can occur only if a future code change introduces a TRAMP-shaped
+     entry into the bridge-hardcoded list.
+  2. Checks `file-attributes' on the candidate; returns the candidate
+     iff the file exists AND is a regular file (not a directory,
+     symlink, or other non-regular file).
+
+Returns nil if no candidate qualifies.  The `getconfigpath' handler
+(and any future `getconfig' implementation) consumes this walker to
+implement the upstream-compatible first-existing-candidate semantics."
+  (cl-block found
+    (dolist (candidate firefox-to-emacs-native-messenger-rcpath-candidates)
+      (firefox-to-emacs-native-messenger--tramp-guard candidate)
+      (let ((attrs (file-attributes candidate)))
+        (when (and attrs (null (file-attribute-type attrs)))
+          (cl-return-from found candidate))))
+    nil))
+
+(defun firefox-to-emacs-native-messenger--getconfigpath-handler
+    (_client _request)
+  "Return the upstream-compatible `getconfigpath' response.
+
+Invokes `--find-rcpath' to locate the first existing rcpath candidate.
+On a hit, returns `((cmd . \"getconfigpath\") (content . PATH) (code
+. 0))' matching the PROTOCOL.md `getconfigpath-success' fixture.  On a
+miss, returns `((cmd . \"getconfigpath\") (code . 1))' matching the
+`getconfigpath-empty' fixture (no `content' field).
+
+The handler is UNGATED per REQ-4600: no whitelist applies, the handler
+takes no request fields, and the returned path is NOT registered in
+the capability registry (REQ-4700).  The candidate list is
+bridge-hardcoded; the rationale parallels the `temp' handler's
+no-gate posture (security boundary lives elsewhere).
+
+CLIENT and REQUEST are accepted for dispatch-table uniformity and not
+consulted."
+  (let ((path (firefox-to-emacs-native-messenger--find-rcpath)))
+    (if path
+        (list (cons 'cmd "getconfigpath")
+              (cons 'content path)
+              (cons 'code 0))
+      (list (cons 'cmd "getconfigpath")
+            (cons 'code 1)))))
+
+(defun firefox-to-emacs-native-messenger--read-handler (_client request)
+  "Implement the `read' cmd per PROTOCOL.md Sections 5, 12, 15, 16.
+
+Composition order per REQ-3300:
+
+  1. Field validation: `file' MUST be a string.  Missing / null /
+     non-string `file' returns the generic error response
+     \"missing required field: file\" without any I/O.
+  2. Per-gate VALIDATOR (PAT-1100 site 3) on the current
+     `firefox-to-emacs-native-messenger-read-whitelist'.  On malformed
+     value the validator signals `whitelist-malformed'; the handler
+     catches and emits the generic error WITHOUT invoking PAT-0400.
+  3. PAT-0400 path expansion (TRAMP guards before and after).
+     On TRAMP rejection the handler emits the generic error wording
+     \"remote paths not permitted\" matching the
+     `read-tramp-rejection' fixture.
+  4. Whitelist MATCH against the expanded path via
+     `--read-gate-match-p'.  On miss, returns
+     \"path not in whitelist\".
+  5. Bounded read: reads up to (outbound-cap + 1) bytes from the file
+     via `insert-file-contents-literally' into a unibyte buffer.  If
+     the raw read returned (outbound-cap + 1) bytes, returns the
+     generic error \"file too large to return\" without building a
+     content field.  Otherwise returns the upstream success shape
+     `((cmd . \"read\") (content . CONTENT) (code . 0))'.
+  6. Open-failure: a `file-error' (typically missing file or
+     permission denied) returns the upstream open-failure shape
+     `((cmd . \"read\") (content . \"\") (code . 2))' per PROTOCOL.md
+     Section 5.  This shape is distinct from the generic error shape.
+
+CLIENT is accepted for dispatch-table uniformity and not consulted."
+  (let ((file-cell (assq 'file request)))
+    (cond
+      ((or (null file-cell) (not (stringp (cdr file-cell))))
+        (firefox-to-emacs-native-messenger--build-error-response
+          "missing required field: file"))
+      (t
+        (firefox-to-emacs-native-messenger--read-handler--gated
+          (cdr file-cell))))))
+
+(defun firefox-to-emacs-native-messenger--read-handler--gated (raw-path)
+  "Run the validate-expand-match-read sequence on RAW-PATH from a `read' request.
+
+Returns the wire response alist.  Translates the various internal
+signals into the fixture-defined error wordings."
+  (condition-case err
+      (progn
+        (firefox-to-emacs-native-messenger--validate-whitelist
+          firefox-to-emacs-native-messenger-read-whitelist 'read)
+        (let ((expanded
+                (firefox-to-emacs-native-messenger--expand-path raw-path)))
+          (cond
+            ((firefox-to-emacs-native-messenger--read-gate-match-p expanded)
+              (firefox-to-emacs-native-messenger--read-handler--read-file
+                expanded))
+            (t
+              (firefox-to-emacs-native-messenger--build-error-response
+                "path not in whitelist")))))
+    (firefox-to-emacs-native-messenger-bad-request
+      (firefox-to-emacs-native-messenger--build-error-response
+        "remote paths not permitted"))
+    (firefox-to-emacs-native-messenger-whitelist-malformed
+      (firefox-to-emacs-native-messenger--build-error-response
+        (format "whitelist malformed: %s"
+                (error-message-string err))))))
+
+(defun firefox-to-emacs-native-messenger--read-handler--read-file (path)
+  "Bounded-read PATH and return the wire response.
+
+Reads up to (outbound-cap + 1) bytes via
+`insert-file-contents-literally' into a unibyte buffer; a fill-to-cap+1
+read produces the `file too large to return' generic error; open
+failure produces the upstream `read' open-failure shape (`content =
+\"\"', `code = 2')."
+  (let* ((outbound-cap
+           firefox-to-emacs-native-messenger-outbound-response-cap)
+         (read-cap (1+ outbound-cap)))
+    (condition-case _err
+        (with-temp-buffer
+          (set-buffer-multibyte nil)
+          (insert-file-contents-literally path nil 0 read-cap)
+          (let ((bytes-read (buffer-size)))
+            (cond
+              ((>= bytes-read read-cap)
+                (firefox-to-emacs-native-messenger--build-error-response
+                  "file too large to return"))
+              (t
+                (list (cons 'cmd "read")
+                      (cons 'content
+                            (decode-coding-string (buffer-string) 'utf-8))
+                      (cons 'code 0))))))
+      (file-error
+        (list (cons 'cmd "read")
+              (cons 'content "")
+              (cons 'code 2))))))
+
+;;;; Register the four synchronous v2 handlers in the dispatcher table.
+;;;; Per REQ-1600, only these four cmds (plus `run' added in Phase 0800)
+;;;; are implemented; every other cmd falls through to "Unhandled message".
+
+(puthash "version"
+         #'firefox-to-emacs-native-messenger--version-handler
+         firefox-to-emacs-native-messenger--handlers)
+(puthash "getconfigpath"
+         #'firefox-to-emacs-native-messenger--getconfigpath-handler
+         firefox-to-emacs-native-messenger--handlers)
+(puthash "temp"
+         #'firefox-to-emacs-native-messenger--temp-handler
+         firefox-to-emacs-native-messenger--handlers)
+(puthash "read"
+         #'firefox-to-emacs-native-messenger--read-handler
+         firefox-to-emacs-native-messenger--handlers)
 
 ;;;###autoload
 (defun firefox-to-emacs-native-messenger-start ()

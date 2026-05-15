@@ -3826,5 +3826,1134 @@ serialized; a cap below that triggers the degenerate fallback."
                      server
                      firefox-to-emacs-native-messenger--connection-key-state)))))))
 
+
+;;;; ============================================================
+;;;; Phase 0700: handlers, gates, and supporting helpers.
+;;;; ============================================================
+
+;;;; TASK-13700: TRAMP guard tests.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-tramp-guard-rejects-ssh ()
+  "TRAMP guard signals `bad-request' for an /ssh: TRAMP path.
+
+Per SEC-0100, paths that `file-remote-p' recognizes as remote MUST be
+rejected by the guard with the bridge's `bad-request' error condition
+before any I/O is attempted."
+  :tags '(:unit)
+  (should-error
+   (firefox-to-emacs-native-messenger--tramp-guard "/ssh:host:/tmp/file")
+   :type 'firefox-to-emacs-native-messenger-bad-request))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-tramp-guard-rejects-sudo ()
+  "TRAMP guard signals `bad-request' for a /sudo: TRAMP path."
+  :tags '(:unit)
+  (should-error
+   (firefox-to-emacs-native-messenger--tramp-guard "/sudo:root@:/etc/passwd")
+   :type 'firefox-to-emacs-native-messenger-bad-request))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-tramp-guard-rejects-docker ()
+  "TRAMP guard signals `bad-request' for a /docker: TRAMP path."
+  :tags '(:unit)
+  (should-error
+   (firefox-to-emacs-native-messenger--tramp-guard "/docker:c:/x")
+   :type 'firefox-to-emacs-native-messenger-bad-request))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-tramp-guard-passes-local ()
+  "TRAMP guard returns local paths unchanged.
+
+`file-remote-p' returns nil for non-remote paths; the guard MUST return
+its argument unchanged so callers can chain it inside expressions like
+`(setq path (--tramp-guard path))'."
+  :tags '(:unit)
+  (should (equal "/tmp/local-file"
+                 (firefox-to-emacs-native-messenger--tramp-guard
+                  "/tmp/local-file")))
+  (should (equal "/home/user/file.txt"
+                 (firefox-to-emacs-native-messenger--tramp-guard
+                  "/home/user/file.txt")))
+  (should (equal "relative/path"
+                 (firefox-to-emacs-native-messenger--tramp-guard
+                  "relative/path"))))
+
+;;;; TASK-13900: path-expansion helper (PAT-0400) tests.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-expand-path-rejects-raw-tramp ()
+  "Raw TRAMP input is rejected by the first TRAMP guard before any expansion.
+
+PAT-0400 step 1 runs the TRAMP guard on the raw path argument before
+let-binding `default-directory' or invoking `substitute-env-vars';
+the resulting signal MUST be `bad-request'."
+  :tags '(:unit)
+  (should-error
+   (firefox-to-emacs-native-messenger--expand-path "/ssh:host:/etc/hosts")
+   :type 'firefox-to-emacs-native-messenger-bad-request)
+  (should-error
+   (firefox-to-emacs-native-messenger--expand-path "/sudo:root@:/etc/passwd")
+   :type 'firefox-to-emacs-native-messenger-bad-request))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-expand-path-rejects-expanded-tramp ()
+  "Local raw input that EXPANDS to a TRAMP path is rejected by the second guard.
+
+PAT-0400's second TRAMP guard (step 5) runs after `substitute-env-vars'
+and `expand-file-name'.  An env-var bound to a TRAMP-shaped prefix
+makes the expanded path remote even though the raw input wasn't."
+  :tags '(:unit)
+  (let ((process-environment
+         (cons "FENM_TEST_REMOTE=/ssh:host:" process-environment)))
+    (should-error
+     (firefox-to-emacs-native-messenger--expand-path "$FENM_TEST_REMOTE/etc/hosts")
+     :type 'firefox-to-emacs-native-messenger-bad-request)))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-expand-path-substitutes-set-env-var ()
+  "A set env-var reference is replaced with its value per PAT-0400 step 3."
+  :tags '(:unit)
+  (let ((process-environment
+         (cons "FENM_TEST_DIR=/tmp/fenm-test-dir" process-environment)))
+    (should (equal "/tmp/fenm-test-dir/file.txt"
+                   (firefox-to-emacs-native-messenger--expand-path
+                    "$FENM_TEST_DIR/file.txt")))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-expand-path-unset-env-var-literal-passthrough ()
+  "An unset env-var reference passes through literally per PAT-0400 step 3.
+
+`substitute-env-vars' with WHEN-UNDEFINED set to nil leaves unset
+references in place; the bridge invokes it with that behavior so a
+path containing an unset variable is not silently rewritten to an
+empty segment."
+  :tags '(:unit)
+  (let ((process-environment
+         (seq-filter
+          (lambda (e) (not (string-prefix-p "FENM_TEST_UNSET_" e)))
+          process-environment)))
+    (let ((result
+           (firefox-to-emacs-native-messenger--expand-path
+            "/tmp/$FENM_TEST_UNSET_VAR/file")))
+      (should (equal "/tmp/$FENM_TEST_UNSET_VAR/file" result)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-expand-path-absolute-pass-through ()
+  "Absolute paths pass through `expand-file-name' idempotently."
+  :tags '(:unit)
+  (should (equal "/etc/hosts"
+                 (firefox-to-emacs-native-messenger--expand-path "/etc/hosts")))
+  (should (equal "/tmp/foo/bar"
+                 (firefox-to-emacs-native-messenger--expand-path
+                  "/tmp/foo/bar"))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-expand-path-tilde-resolves-to-home ()
+  "~ in the raw input is expanded against the user's home directory."
+  :tags '(:unit)
+  (should (equal (expand-file-name "~/some-file.txt")
+                 (firefox-to-emacs-native-messenger--expand-path
+                  "~/some-file.txt"))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-expand-path-relative-resolves-under-home ()
+  "Relative paths resolve against the let-bound `default-directory' of ~/.
+
+PAT-0400 step 2 binds `default-directory' to ~/ before
+`expand-file-name' runs; a relative input therefore resolves under
+the user's home directory regardless of the caller's
+`default-directory'."
+  :tags '(:unit)
+  (let ((default-directory "/etc/"))
+    (should (equal (expand-file-name "subdir/file.txt" "~/")
+                   (firefox-to-emacs-native-messenger--expand-path
+                    "subdir/file.txt")))))
+
+
+;;;; TASK-14100: read path-gate tests.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-gate-empty-rejects ()
+  "Empty (nil) or empty-list read-whitelist rejects every path per REQ-3700."
+  :tags '(:unit)
+  (let ((firefox-to-emacs-native-messenger-read-whitelist nil))
+    (should-not (firefox-to-emacs-native-messenger--read-gate-match-p
+                 "/tmp/anything")))
+  (let ((firefox-to-emacs-native-messenger-read-whitelist '()))
+    (should-not (firefox-to-emacs-native-messenger--read-gate-match-p
+                 "/tmp/anything"))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-gate-allow-all-accepts ()
+  "The (\"*\") sentinel allows any path through the gate per REQ-3800."
+  :tags '(:unit)
+  (let ((firefox-to-emacs-native-messenger-read-whitelist '("*")))
+    (should (firefox-to-emacs-native-messenger--read-gate-match-p "/tmp/any-file"))
+    (should (firefox-to-emacs-native-messenger--read-gate-match-p
+             "/home/user/somewhere/else.txt"))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-gate-literal-match ()
+  "A literal absolute-path entry matches the expanded path verbatim."
+  :tags '(:unit)
+  (let ((firefox-to-emacs-native-messenger-read-whitelist
+         '("/tmp/specific-file.txt")))
+    (should (firefox-to-emacs-native-messenger--read-gate-match-p
+             "/tmp/specific-file.txt"))
+    (should-not (firefox-to-emacs-native-messenger--read-gate-match-p
+                 "/tmp/specific-file.txt.bak"))
+    (should-not (firefox-to-emacs-native-messenger--read-gate-match-p
+                 "/tmp/other-file.txt"))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-gate-glob-match ()
+  "A glob entry matches per `--glob-match-p' semantics (REQ-2900)."
+  :tags '(:unit)
+  (let ((firefox-to-emacs-native-messenger-read-whitelist
+         '("/home/user/projects/*.txt")))
+    (should (firefox-to-emacs-native-messenger--read-gate-match-p
+             "/home/user/projects/notes.txt"))
+    (should-not (firefox-to-emacs-native-messenger--read-gate-match-p
+                 "/home/user/projects/sub/notes.txt"))
+    (should-not (firefox-to-emacs-native-messenger--read-gate-match-p
+                 "/home/user/projects/notes.md")))
+  (let ((firefox-to-emacs-native-messenger-read-whitelist
+         '("/home/user/**/*.txt")))
+    (should (firefox-to-emacs-native-messenger--read-gate-match-p
+             "/home/user/deep/sub/notes.txt"))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-gate-temp-path-marker-hit ()
+  "The <TEMP-PATH> marker matches iff the path is in the capability registry."
+  :tags '(:unit)
+  (firefox-to-emacs-native-messenger-test--with-stub-registry
+      '("/tmp/registered-tempfile.txt")
+    (let ((firefox-to-emacs-native-messenger-read-whitelist '("<TEMP-PATH>")))
+      (should (firefox-to-emacs-native-messenger--read-gate-match-p
+               "/tmp/registered-tempfile.txt"))
+      (should-not (firefox-to-emacs-native-messenger--read-gate-match-p
+                   "/tmp/unregistered.txt")))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-gate-temp-path-marker-no-registry ()
+  "The <TEMP-PATH> marker rejects when the path is not in the registry."
+  :tags '(:unit)
+  (firefox-to-emacs-native-messenger-test--with-stub-registry '()
+    (let ((firefox-to-emacs-native-messenger-read-whitelist '("<TEMP-PATH>")))
+      (should-not (firefox-to-emacs-native-messenger--read-gate-match-p
+                   "/tmp/anything-at-all")))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-gate-multi-entry-any-match ()
+  "Multiple entries: gate accepts on the first matching entry."
+  :tags '(:unit)
+  (firefox-to-emacs-native-messenger-test--with-stub-registry
+      '("/tmp/registered.txt")
+    (let ((firefox-to-emacs-native-messenger-read-whitelist
+           '("<TEMP-PATH>" "/etc/some-config" "/home/user/*.rc")))
+      (should (firefox-to-emacs-native-messenger--read-gate-match-p
+               "/tmp/registered.txt"))
+      (should (firefox-to-emacs-native-messenger--read-gate-match-p
+               "/etc/some-config"))
+      (should (firefox-to-emacs-native-messenger--read-gate-match-p
+               "/home/user/foo.rc"))
+      (should-not (firefox-to-emacs-native-messenger--read-gate-match-p
+                   "/etc/something-else")))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-gate-malformed-signals ()
+  "Per-gate validator at gate-check time signals `whitelist-malformed' on bad input.
+
+PAT-1100 site 3 re-validates the whitelist defcustom at every gate check.
+The let-binding here intentionally bypasses the variable watcher's
+:set validator (PAT-1100 site 1), simulating a value that arrived via
+list mutation or other non-assignment path."
+  :tags '(:unit)
+  (let ((firefox-to-emacs-native-messenger-read-whitelist
+         '("*" "/etc/oops")))
+    (should-error
+     (firefox-to-emacs-native-messenger--read-gate-match-p "/tmp/whatever")
+     :type 'firefox-to-emacs-native-messenger-whitelist-malformed))
+  (let ((firefox-to-emacs-native-messenger-read-whitelist
+         '("relative/path/not/allowed")))
+    (should-error
+     (firefox-to-emacs-native-messenger--read-gate-match-p "/tmp/whatever")
+     :type 'firefox-to-emacs-native-messenger-whitelist-malformed)))
+
+;;;; TASK-14300: `version' handler tests.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-version-handler-fixture ()
+  "The `version' handler returns the PROTOCOL.md `version-success' fixture.
+
+The fixture pins the wire response to `((cmd . \"version\") (version
+. \"0.3.7\") (code . 0))'.  The handler takes no request fields, has
+no gate, and is a pure function of the bridge's version defconst."
+  :tags '(:unit :fixture-driven)
+  (let* ((fixture (firefox-to-emacs-native-messenger-test-load-fixture
+                   "version-success"))
+         (expected-response (alist-get 'response fixture))
+         (actual-response (firefox-to-emacs-native-messenger--version-handler
+                           nil '((cmd . "version")))))
+    (should (firefox-to-emacs-native-messenger-test-fixture-equal-p
+             expected-response actual-response))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-version-handler-ignores-extra-fields ()
+  "The `version' handler reads no request fields; extra fields are ignored."
+  :tags '(:unit)
+  (let ((response (firefox-to-emacs-native-messenger--version-handler
+                   nil
+                   '((cmd . "version")
+                     (file . "/some/path")
+                     (extra . "ignored")))))
+    (should (equal "version" (alist-get 'cmd response)))
+    (should (stringp (alist-get 'version response)))
+    (should (= 0 (alist-get 'code response)))))
+
+;;;; TASK-14500: `temp' handler prefix sanitization tests.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-sanitize-temp-prefix-lowercases ()
+  "Sanitization lowercases ASCII letters per upstream `sanitiseFilename'."
+  :tags '(:unit)
+  (should (equal "example.com"
+                 (firefox-to-emacs-native-messenger--sanitize-temp-prefix
+                  "Example.com")))
+  (should (equal "abc"
+                 (firefox-to-emacs-native-messenger--sanitize-temp-prefix
+                  "ABC")))
+  (should (equal "mixedcase"
+                 (firefox-to-emacs-native-messenger--sanitize-temp-prefix
+                  "MixedCase"))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-sanitize-temp-prefix-retains-alnum-dot ()
+  "Sanitization retains ASCII letters, digits, and dots; drops everything else."
+  :tags '(:unit)
+  (should (equal "abc123"
+                 (firefox-to-emacs-native-messenger--sanitize-temp-prefix
+                  "abc123")))
+  (should (equal "a.b.c"
+                 (firefox-to-emacs-native-messenger--sanitize-temp-prefix
+                  "a.b.c")))
+  (should (equal "abc"
+                 (firefox-to-emacs-native-messenger--sanitize-temp-prefix
+                  "a-b-c")))
+  (should (equal "abc"
+                 (firefox-to-emacs-native-messenger--sanitize-temp-prefix
+                  "a b c")))
+  (should (equal "abc"
+                 (firefox-to-emacs-native-messenger--sanitize-temp-prefix
+                  "a/b/c"))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-sanitize-temp-prefix-collapses-repeated-dots ()
+  "Sanitization collapses runs of two or more consecutive dots to a single dot."
+  :tags '(:unit)
+  (should (equal "."
+                 (firefox-to-emacs-native-messenger--sanitize-temp-prefix
+                  "..")))
+  (should (equal "."
+                 (firefox-to-emacs-native-messenger--sanitize-temp-prefix
+                  "...")))
+  (should (equal "a.b"
+                 (firefox-to-emacs-native-messenger--sanitize-temp-prefix
+                  "a..b")))
+  (should (equal "a.b.c"
+                 (firefox-to-emacs-native-messenger--sanitize-temp-prefix
+                  "a..b...c"))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-sanitize-temp-prefix-empty-cases ()
+  "Empty and pathological inputs produce the empty string."
+  :tags '(:unit)
+  (should (equal ""
+                 (firefox-to-emacs-native-messenger--sanitize-temp-prefix
+                  "")))
+  (should (equal ""
+                 (firefox-to-emacs-native-messenger--sanitize-temp-prefix
+                  nil)))
+  (should (equal ""
+                 (firefox-to-emacs-native-messenger--sanitize-temp-prefix
+                  "---")))
+  (should (equal ""
+                 (firefox-to-emacs-native-messenger--sanitize-temp-prefix
+                  "!@#$%"))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-sanitize-temp-prefix-combined ()
+  "All sanitization stages compose in the order: lowercase, strip, collapse."
+  :tags '(:unit)
+  (should (equal "example.com"
+                 (firefox-to-emacs-native-messenger--sanitize-temp-prefix
+                  "Example.Com")))
+  (should (equal "host.with.dots"
+                 (firefox-to-emacs-native-messenger--sanitize-temp-prefix
+                  "Host..With..Dots")))
+  (should (equal "abc"
+                 (firefox-to-emacs-native-messenger--sanitize-temp-prefix
+                  "A-B-C"))))
+
+;;;; TASK-14700: `temp' handler end-to-end tests.
+
+(defmacro firefox-to-emacs-native-messenger-test--with-temp-handler-env
+    (tmp &rest body)
+  "Bind TMP to a sandbox tempfile dir with a fresh registry around BODY."
+  (declare (indent 1) (debug (symbolp body)))
+  `(firefox-to-emacs-native-messenger-test--with-sandbox-tempfile-dir ,tmp
+     (firefox-to-emacs-native-messenger-test--with-fresh-registry
+      ,@body)))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-temp-handler-success-response ()
+  "Successful `temp' returns the success fixture shape with the new path."
+  :tags '(:integration :sandbox :fixture-driven)
+  (firefox-to-emacs-native-messenger-test--with-temp-handler-env tmp
+    (let* ((request '((cmd . "temp")
+                      (content . "hello world")
+                      (prefix . "example.com")))
+           (response (firefox-to-emacs-native-messenger--temp-handler
+                      nil request))
+           (path (alist-get 'content response)))
+      (should (equal "temp" (alist-get 'cmd response)))
+      (should (= 0 (alist-get 'code response)))
+      (should (stringp path))
+      (should (string-prefix-p tmp path))
+      (should (file-exists-p path)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-temp-handler-writes-content ()
+  "Tempfile contents equal the request's content byte-for-byte."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-temp-handler-env _tmp
+    (let* ((content "line 1\nline 2\n\nblank above\n")
+           (request `((cmd . "temp")
+                      (content . ,content)
+                      (prefix . "test")))
+           (response (firefox-to-emacs-native-messenger--temp-handler
+                      nil request))
+           (path (alist-get 'content response)))
+      (should (equal content
+                     (with-temp-buffer
+                       (insert-file-contents-literally path)
+                       (buffer-string)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-temp-handler-file-mode-0600 ()
+  "Tempfile is created with mode 0600 (no group or world bits)."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-temp-handler-env _tmp
+    (let* ((request '((cmd . "temp") (content . "x") (prefix . "t")))
+           (response (firefox-to-emacs-native-messenger--temp-handler
+                      nil request))
+           (path (alist-get 'content response)))
+      (should (= #o600 (logand #o777 (file-modes path)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-temp-handler-registers-path ()
+  "Tempfile path is entered into the capability registry on success per PAT-1000."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-temp-handler-env _tmp
+    (let* ((request '((cmd . "temp") (content . "x") (prefix . "t")))
+           (response (firefox-to-emacs-native-messenger--temp-handler
+                      nil request))
+           (path (alist-get 'content response)))
+      (should (firefox-to-emacs-native-messenger--registry-contains-p path)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-temp-handler-sanitized-prefix-in-path ()
+  "The sanitized prefix appears between `tmp_' and the random component."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-temp-handler-env _tmp
+    (let* ((request '((cmd . "temp")
+                      (content . "x")
+                      (prefix . "Example.Com")))
+           (response (firefox-to-emacs-native-messenger--temp-handler
+                      nil request))
+           (path (alist-get 'content response))
+           (name (file-name-nondirectory path)))
+      (should (string-match-p "\\`tmp_example.com_" name))
+      (should (string-suffix-p ".txt" name)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-temp-handler-empty-prefix-ok ()
+  "Empty or absent `prefix' produces `tmp__'-style filenames; still .txt suffix."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-temp-handler-env _tmp
+    (let* ((request '((cmd . "temp") (content . "x")))
+           (response (firefox-to-emacs-native-messenger--temp-handler
+                      nil request))
+           (path (alist-get 'content response))
+           (name (file-name-nondirectory path)))
+      (should (= 0 (alist-get 'code response)))
+      (should (string-match-p "\\`tmp__" name))
+      (should (string-suffix-p ".txt" name)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-temp-handler-missing-content ()
+  "Missing `content' field returns generic error and creates no tempfile."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-temp-handler-env tmp
+    (let* ((request '((cmd . "temp") (prefix . "x")))
+           (response (firefox-to-emacs-native-messenger--temp-handler
+                      nil request)))
+      (should (equal "error" (alist-get 'cmd response)))
+      (should (string-match-p "content"
+                              (alist-get 'error response)))
+      (should-not (alist-get 'code response))
+      (should (= 0 (length (directory-files tmp nil "\\`tmp_")))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-temp-handler-null-content ()
+  "Null `content' (JSON null arrives as nil) returns generic error, no file."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-temp-handler-env tmp
+    (let* ((request '((cmd . "temp") (content . nil) (prefix . "x")))
+           (response (firefox-to-emacs-native-messenger--temp-handler
+                      nil request)))
+      (should (equal "error" (alist-get 'cmd response)))
+      (should (= 0 (length (directory-files tmp nil "\\`tmp_")))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-temp-handler-non-string-content ()
+  "Non-string `content' (e.g., a number) returns generic error, no file."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-temp-handler-env tmp
+    (let* ((request '((cmd . "temp") (content . 42) (prefix . "x")))
+           (response (firefox-to-emacs-native-messenger--temp-handler
+                      nil request)))
+      (should (equal "error" (alist-get 'cmd response)))
+      (should (= 0 (length (directory-files tmp nil "\\`tmp_")))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-temp-handler-registry-cap-exceeded ()
+  "When the registry cap is exceeded after prune-all, returns error and no file.
+
+Pre-fills the registry with N valid entries pointing at existing files in
+the sandbox so prune-all is a no-op; sets the cap to N; calls temp; expects
+the generic error and no new tempfile."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-temp-handler-env tmp
+    (firefox-to-emacs-native-messenger-test--with-saved-registry-cap
+     (let ((firefox-to-emacs-native-messenger-temp-registry-cap 2))
+       (let ((p1 (expand-file-name "tmp_preexist_a.txt" tmp))
+             (p2 (expand-file-name "tmp_preexist_b.txt" tmp)))
+         (with-temp-file p1 (insert "a"))
+         (with-temp-file p2 (insert "b"))
+         (firefox-to-emacs-native-messenger--registry-register p1)
+         (firefox-to-emacs-native-messenger--registry-register p2)
+         (let* ((before-count
+                 (length (directory-files tmp nil "\\`tmp_")))
+                (request '((cmd . "temp") (content . "x") (prefix . "t")))
+                (response (firefox-to-emacs-native-messenger--temp-handler
+                           nil request))
+                (after-count
+                 (length (directory-files tmp nil "\\`tmp_"))))
+           (should (equal "error" (alist-get 'cmd response)))
+           (should (string-match-p "temp registry cap exceeded"
+                                   (alist-get 'error response)))
+           (should (= before-count after-count))))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-temp-handler-cap-prune-then-succeed ()
+  "Prune-all clears stale entries to make room when the cap is reached.
+
+Pre-fills the registry with N entries pointing at files that DO NOT exist;
+sets the cap to N; calls temp.  Prune-all removes all stale entries
+because their files are missing; count drops to 0; temp succeeds."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-temp-handler-env tmp
+    (firefox-to-emacs-native-messenger-test--with-saved-registry-cap
+     (let ((firefox-to-emacs-native-messenger-temp-registry-cap 2))
+       (let ((stale-a (expand-file-name "missing-a" tmp))
+             (stale-b (expand-file-name "missing-b" tmp)))
+         (puthash stale-a (list :dev 0 :inode 0 :uid 0)
+                  firefox-to-emacs-native-messenger--capability-registry)
+         (puthash stale-b (list :dev 0 :inode 0 :uid 0)
+                  firefox-to-emacs-native-messenger--capability-registry)
+         (let* ((request '((cmd . "temp") (content . "x") (prefix . "t")))
+                (response (firefox-to-emacs-native-messenger--temp-handler
+                           nil request)))
+           (should (equal "temp" (alist-get 'cmd response)))
+           (should (= 0 (alist-get 'code response)))))))))
+
+;;;; TASK-14900: `temp' handler no-gate (ungated per REQ-2600).
+
+(ert-deftest firefox-to-emacs-native-messenger-test-temp-handler-ungated-deny-all-whitelists ()
+  "`temp' succeeds with both whitelists at nil (deny-all) per REQ-2600.
+
+The handler is structurally ungated: no per-handler whitelist applies.
+Setting both `run-whitelist' and `read-whitelist' to nil therefore
+must NOT prevent a `temp' request from creating its file."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-temp-handler-env _tmp
+    (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+     (setq firefox-to-emacs-native-messenger-run-whitelist nil)
+     (setq firefox-to-emacs-native-messenger-read-whitelist nil)
+     (let* ((request '((cmd . "temp") (content . "x") (prefix . "t")))
+            (response (firefox-to-emacs-native-messenger--temp-handler
+                       nil request)))
+       (should (equal "temp" (alist-get 'cmd response)))
+       (should (= 0 (alist-get 'code response)))
+       (should (stringp (alist-get 'content response)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-temp-handler-ungated-allow-all-equivalent ()
+  "`temp' produces the same response shape under any whitelist value.
+
+REQ-2600 requires `temp' to be insensitive to per-handler whitelists;
+two requests sent in the same listener lifetime but under different
+whitelist configurations therefore produce structurally identical
+success responses."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-temp-handler-env _tmp
+    (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+     (setq firefox-to-emacs-native-messenger-run-whitelist nil)
+     (setq firefox-to-emacs-native-messenger-read-whitelist nil)
+     (let* ((r1 (firefox-to-emacs-native-messenger--temp-handler
+                 nil '((cmd . "temp") (content . "a") (prefix . "t")))))
+       (setq firefox-to-emacs-native-messenger-run-whitelist '("*"))
+       (setq firefox-to-emacs-native-messenger-read-whitelist '("*"))
+       (let ((r2 (firefox-to-emacs-native-messenger--temp-handler
+                  nil '((cmd . "temp") (content . "b") (prefix . "t")))))
+         (should (equal (alist-get 'cmd r1) (alist-get 'cmd r2)))
+         (should (equal (alist-get 'code r1) (alist-get 'code r2)))
+         (should (stringp (alist-get 'content r1)))
+         (should (stringp (alist-get 'content r2))))))))
+
+;;;; TASK-15100: rcpath candidate-list walker tests.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-find-rcpath-none-exist ()
+  "Returns nil when no candidate exists on disk."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+    (let ((firefox-to-emacs-native-messenger-rcpath-candidates
+           (list
+            (expand-file-name "a.rc" dir)
+            (expand-file-name "b.rc" dir))))
+      (should-not (firefox-to-emacs-native-messenger--find-rcpath)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-find-rcpath-only-second-exists ()
+  "Returns the second candidate when only it exists on disk."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+    (let ((p1 (expand-file-name "first.rc" dir))
+          (p2 (expand-file-name "second.rc" dir)))
+      (with-temp-file p2 (insert "rc content"))
+      (let ((firefox-to-emacs-native-messenger-rcpath-candidates
+             (list p1 p2)))
+        (should (equal p2 (firefox-to-emacs-native-messenger--find-rcpath)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-find-rcpath-first-and-third-exist ()
+  "Returns the FIRST existing candidate when multiple candidates exist."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+    (let ((p1 (expand-file-name "first.rc" dir))
+          (p2 (expand-file-name "second.rc" dir))
+          (p3 (expand-file-name "third.rc" dir)))
+      (with-temp-file p1 (insert "first"))
+      (with-temp-file p3 (insert "third"))
+      (let ((firefox-to-emacs-native-messenger-rcpath-candidates
+             (list p1 p2 p3)))
+        (should (equal p1 (firefox-to-emacs-native-messenger--find-rcpath)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-find-rcpath-tramp-candidate-rejects ()
+  "A TRAMP-shaped candidate in the list signals `bad-request' defensively per SEC-1300."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+    (let ((firefox-to-emacs-native-messenger-rcpath-candidates
+           (list "/ssh:host:/etc/some.rc"
+                 (expand-file-name "local.rc" dir))))
+      (should-error
+       (firefox-to-emacs-native-messenger--find-rcpath)
+       :type 'firefox-to-emacs-native-messenger-bad-request))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-find-rcpath-skips-directory ()
+  "A candidate that resolves to a directory is skipped (only regular files match)."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+    (let ((subdir (expand-file-name "candidate-dir" dir))
+          (regular (expand-file-name "regular.rc" dir)))
+      (make-directory subdir)
+      (with-temp-file regular (insert "ok"))
+      (let ((firefox-to-emacs-native-messenger-rcpath-candidates
+             (list subdir regular)))
+        (should (equal regular
+                       (firefox-to-emacs-native-messenger--find-rcpath)))))))
+
+;;;; TASK-15300: `getconfigpath' handler tests.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-getconfigpath-success-fixture ()
+  "With one candidate present in the sandbox, returns the success-fixture shape."
+  :tags '(:unit :sandbox :fixture-driven)
+  (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+    (let* ((rc-path (expand-file-name "tridactylrc" dir))
+           (firefox-to-emacs-native-messenger-rcpath-candidates
+            (list rc-path)))
+      (with-temp-file rc-path (insert "config content"))
+      (let* ((fixture
+              (firefox-to-emacs-native-messenger-test-load-fixture
+               "getconfigpath-success"))
+             (expected-response (alist-get 'response fixture))
+             (actual-response
+              (firefox-to-emacs-native-messenger--getconfigpath-handler
+               nil '((cmd . "getconfigpath")))))
+        (should (firefox-to-emacs-native-messenger-test-fixture-equal-p
+                 expected-response actual-response))
+        (should (equal rc-path (alist-get 'content actual-response)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-getconfigpath-empty-fixture ()
+  "With no candidate present, returns the empty-fixture shape (no content field, code 1)."
+  :tags '(:unit :sandbox :fixture-driven)
+  (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+    (let ((firefox-to-emacs-native-messenger-rcpath-candidates
+           (list (expand-file-name "missing-a.rc" dir)
+                 (expand-file-name "missing-b.rc" dir))))
+      (let* ((fixture
+              (firefox-to-emacs-native-messenger-test-load-fixture
+               "getconfigpath-empty"))
+             (expected-response (alist-get 'response fixture))
+             (actual-response
+              (firefox-to-emacs-native-messenger--getconfigpath-handler
+               nil '((cmd . "getconfigpath")))))
+        (should (firefox-to-emacs-native-messenger-test-fixture-equal-p
+                 expected-response actual-response))
+        (should (equal "getconfigpath" (alist-get 'cmd actual-response)))
+        (should (= 1 (alist-get 'code actual-response)))
+        (should-not (alist-get 'content actual-response))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-getconfigpath-ignores-extra-fields ()
+  "The handler reads no request fields; extra fields in the request are ignored."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+    (let* ((rc-path (expand-file-name "tridactylrc" dir))
+           (firefox-to-emacs-native-messenger-rcpath-candidates
+            (list rc-path)))
+      (with-temp-file rc-path (insert "content"))
+      (let ((response
+             (firefox-to-emacs-native-messenger--getconfigpath-handler
+              nil '((cmd . "getconfigpath")
+                    (file . "/should/be/ignored")
+                    (junk . 42)))))
+        (should (equal rc-path (alist-get 'content response)))
+        (should (= 0 (alist-get 'code response)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-getconfigpath-ungated ()
+  "`getconfigpath' succeeds regardless of whitelist defcustom values per REQ-4600."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+    (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+     (let* ((rc-path (expand-file-name "tridactylrc" dir))
+            (firefox-to-emacs-native-messenger-rcpath-candidates
+             (list rc-path)))
+       (with-temp-file rc-path (insert "x"))
+       (setq firefox-to-emacs-native-messenger-run-whitelist nil)
+       (setq firefox-to-emacs-native-messenger-read-whitelist nil)
+       (let ((response
+              (firefox-to-emacs-native-messenger--getconfigpath-handler
+               nil '((cmd . "getconfigpath")))))
+         (should (equal rc-path (alist-get 'content response)))
+         (should (= 0 (alist-get 'code response))))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-getconfigpath-does-not-register ()
+  "The returned path is NOT entered into the capability registry per REQ-4700."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-fresh-registry
+   (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+     (let* ((rc-path (expand-file-name "tridactylrc" dir))
+            (firefox-to-emacs-native-messenger-rcpath-candidates
+             (list rc-path)))
+       (with-temp-file rc-path (insert "x"))
+       (firefox-to-emacs-native-messenger--getconfigpath-handler
+        nil '((cmd . "getconfigpath")))
+       (should-not (firefox-to-emacs-native-messenger--registry-contains-p
+                    rc-path))))))
+
+;;;; TASK-15500: `read' handler gate-composition tests.
+
+(defmacro firefox-to-emacs-native-messenger-test--with-read-env
+    (dir &rest body)
+  "Bind DIR to a sandbox tempdir, give a fresh registry, and save whitelists."
+  (declare (indent 1) (debug (symbolp body)))
+  `(firefox-to-emacs-native-messenger-test-with-sandbox-tempdir ,dir
+     (firefox-to-emacs-native-messenger-test--with-fresh-registry
+      (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+       ,@body))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-handler-raw-tramp-rejected ()
+  "Raw TRAMP `file' produces the generic error wording \"remote paths not permitted\"."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-read-env _dir
+    (setq firefox-to-emacs-native-messenger-read-whitelist '("*"))
+    (let ((response (firefox-to-emacs-native-messenger--read-handler
+                     nil '((cmd . "read")
+                           (file . "/ssh:host:/etc/hosts")))))
+      (should (equal "error" (alist-get 'cmd response)))
+      (should (equal "remote paths not permitted"
+                     (alist-get 'error response))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-handler-expansion-tramp-rejected ()
+  "Local raw `file' that EXPANDS to a TRAMP path is rejected by the second guard."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-read-env _dir
+    (setq firefox-to-emacs-native-messenger-read-whitelist '("*"))
+    (let ((process-environment
+           (cons "FENM_TEST_REMOTE=/ssh:host:" process-environment)))
+      (let ((response (firefox-to-emacs-native-messenger--read-handler
+                       nil '((cmd . "read")
+                             (file . "$FENM_TEST_REMOTE/etc/hosts")))))
+        (should (equal "error" (alist-get 'cmd response)))
+        (should (equal "remote paths not permitted"
+                       (alist-get 'error response)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-handler-empty-whitelist-rejects ()
+  "Local path with deny-all whitelist returns \"path not in whitelist\"."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-read-env dir
+    (let ((path (expand-file-name "readable.txt" dir)))
+      (with-temp-file path (insert "data"))
+      (setq firefox-to-emacs-native-messenger-read-whitelist nil)
+      (let ((response (firefox-to-emacs-native-messenger--read-handler
+                       nil `((cmd . "read") (file . ,path)))))
+        (should (equal "error" (alist-get 'cmd response)))
+        (should (equal "path not in whitelist"
+                       (alist-get 'error response)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-handler-allow-all-accepts ()
+  "(\"*\") whitelist plus existing local path → success with file content."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-read-env dir
+    (let ((path (expand-file-name "ok.txt" dir)))
+      (with-temp-file path (insert "hello"))
+      (setq firefox-to-emacs-native-messenger-read-whitelist '("*"))
+      (let ((response (firefox-to-emacs-native-messenger--read-handler
+                       nil `((cmd . "read") (file . ,path)))))
+        (should (equal "read" (alist-get 'cmd response)))
+        (should (= 0 (alist-get 'code response)))
+        (should (equal "hello" (alist-get 'content response)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-handler-literal-entry-accepts ()
+  "A literal absolute-path whitelist entry matching the expanded path → success."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-read-env dir
+    (let ((path (expand-file-name "literal.txt" dir)))
+      (with-temp-file path (insert "lit"))
+      (setq firefox-to-emacs-native-messenger-read-whitelist
+            (list path))
+      (let ((response (firefox-to-emacs-native-messenger--read-handler
+                       nil `((cmd . "read") (file . ,path)))))
+        (should (equal "read" (alist-get 'cmd response)))
+        (should (equal "lit" (alist-get 'content response)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-handler-glob-entry-accepts ()
+  "A glob whitelist entry matching the expanded path → success."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-read-env dir
+    (let* ((path (expand-file-name "notes.txt" dir))
+           (glob (concat (file-name-as-directory dir) "*.txt")))
+      (with-temp-file path (insert "g"))
+      (setq firefox-to-emacs-native-messenger-read-whitelist (list glob))
+      (let ((response (firefox-to-emacs-native-messenger--read-handler
+                       nil `((cmd . "read") (file . ,path)))))
+        (should (equal "read" (alist-get 'cmd response)))
+        (should (equal "g" (alist-get 'content response)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-handler-temp-marker-registered ()
+  "<TEMP-PATH> marker matches an expanded path that is in the registry."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-read-env dir
+    (let ((path (expand-file-name "tmp.txt" dir)))
+      (with-temp-file path (insert "t"))
+      (firefox-to-emacs-native-messenger--registry-register path)
+      (setq firefox-to-emacs-native-messenger-read-whitelist '("<TEMP-PATH>"))
+      (let ((response (firefox-to-emacs-native-messenger--read-handler
+                       nil `((cmd . "read") (file . ,path)))))
+        (should (equal "read" (alist-get 'cmd response)))
+        (should (equal "t" (alist-get 'content response)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-handler-temp-marker-unregistered ()
+  "<TEMP-PATH> marker rejects when the expanded path is not registered."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-read-env dir
+    (let ((path (expand-file-name "tmp.txt" dir)))
+      (with-temp-file path (insert "t"))
+      (setq firefox-to-emacs-native-messenger-read-whitelist '("<TEMP-PATH>"))
+      (let ((response (firefox-to-emacs-native-messenger--read-handler
+                       nil `((cmd . "read") (file . ,path)))))
+        (should (equal "error" (alist-get 'cmd response)))
+        (should (equal "path not in whitelist"
+                       (alist-get 'error response)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-handler-malformed-before-pat0400 ()
+  "Malformed whitelist at gate-check time errors BEFORE PAT-0400 expansion runs.
+
+The test instruments `--expand-path' with a counter; with a malformed
+whitelist value and a TRAMP-shaped `file' field, expand-path's counter
+MUST remain at zero (validator short-circuits the gate)."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-read-env _dir
+    (setq firefox-to-emacs-native-messenger-read-whitelist '("/tmp/legit"))
+    (let* ((orig-expand
+            (symbol-function 'firefox-to-emacs-native-messenger--expand-path))
+           (expand-calls 0))
+      (cl-letf (((symbol-function
+                  'firefox-to-emacs-native-messenger--expand-path)
+                 (lambda (p)
+                   (cl-incf expand-calls)
+                   (funcall orig-expand p))))
+        (let ((firefox-to-emacs-native-messenger-read-whitelist
+               '("*" "/etc/oops")))
+          (let ((response (firefox-to-emacs-native-messenger--read-handler
+                           nil '((cmd . "read")
+                                 (file . "/ssh:host:/anything")))))
+            (should (equal "error" (alist-get 'cmd response)))
+            (should-not (equal "remote paths not permitted"
+                               (alist-get 'error response)))
+            (should (= 0 expand-calls))))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-handler-missing-file-field ()
+  "Missing or non-string `file' field returns the missing-field generic error."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-read-env _dir
+    (setq firefox-to-emacs-native-messenger-read-whitelist '("*"))
+    (let ((response (firefox-to-emacs-native-messenger--read-handler
+                     nil '((cmd . "read")))))
+      (should (equal "error" (alist-get 'cmd response)))
+      (should (string-match-p "file" (alist-get 'error response))))
+    (let ((response (firefox-to-emacs-native-messenger--read-handler
+                     nil '((cmd . "read") (file . nil)))))
+      (should (equal "error" (alist-get 'cmd response))))
+    (let ((response (firefox-to-emacs-native-messenger--read-handler
+                     nil '((cmd . "read") (file . 42)))))
+      (should (equal "error" (alist-get 'cmd response))))))
+
+;;;; TASK-15600: `read' handler bounded-read tests.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-handler-within-cap-returns-content ()
+  "A small file within the cap returns its content verbatim."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-read-env dir
+    (let ((path (expand-file-name "ok.txt" dir)))
+      (with-temp-file path (insert "abcdef"))
+      (setq firefox-to-emacs-native-messenger-read-whitelist '("*"))
+      (let ((response (firefox-to-emacs-native-messenger--read-handler
+                       nil `((cmd . "read") (file . ,path)))))
+        (should (equal "read" (alist-get 'cmd response)))
+        (should (equal "abcdef" (alist-get 'content response)))
+        (should (= 0 (alist-get 'code response)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-handler-exact-cap-returns-content ()
+  "A file exactly at outbound-response-cap bytes is returned without truncation.
+
+Per PROTOCOL.md Section 12, the bounded-read cap is (outbound-cap + 1)
+so the handler can detect over-cap by observing a fill-to-cap+1 read.
+A file of exactly outbound-cap bytes reads outbound-cap bytes (less
+than the bounded-read cap)."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-read-env dir
+    (let* ((cap 32)
+           (firefox-to-emacs-native-messenger-outbound-response-cap cap)
+           (path (expand-file-name "atcap.txt" dir))
+           (content (make-string cap ?A)))
+      (with-temp-file path (insert content))
+      (setq firefox-to-emacs-native-messenger-read-whitelist '("*"))
+      (let ((response (firefox-to-emacs-native-messenger--read-handler
+                       nil `((cmd . "read") (file . ,path)))))
+        (should (equal "read" (alist-get 'cmd response)))
+        (should (equal content (alist-get 'content response)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-handler-over-cap-returns-error ()
+  "A file with size > outbound-response-cap returns the file-too-large error."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-read-env dir
+    (let* ((cap 32)
+           (firefox-to-emacs-native-messenger-outbound-response-cap cap)
+           (path (expand-file-name "overcap.txt" dir))
+           (content (make-string (+ cap 5) ?B)))
+      (with-temp-file path (insert content))
+      (setq firefox-to-emacs-native-messenger-read-whitelist '("*"))
+      (let ((response (firefox-to-emacs-native-messenger--read-handler
+                       nil `((cmd . "read") (file . ,path)))))
+        (should (equal "error" (alist-get 'cmd response)))
+        (should (equal "file too large to return"
+                       (alist-get 'error response)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-handler-cap-plus-one-detected ()
+  "A file of exactly outbound-cap + 1 bytes triggers the file-too-large error.
+
+PROTOCOL.md Section 12 mandates the bounded-read sees cap+1 bytes
+exactly when the file is at least cap+1 bytes; the handler returns
+the error without building a content field."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-read-env dir
+    (let* ((cap 32)
+           (firefox-to-emacs-native-messenger-outbound-response-cap cap)
+           (path (expand-file-name "exactly-plus-one.txt" dir))
+           (content (make-string (1+ cap) ?C)))
+      (with-temp-file path (insert content))
+      (setq firefox-to-emacs-native-messenger-read-whitelist '("*"))
+      (let ((response (firefox-to-emacs-native-messenger--read-handler
+                       nil `((cmd . "read") (file . ,path)))))
+        (should (equal "error" (alist-get 'cmd response)))
+        (should (equal "file too large to return"
+                       (alist-get 'error response)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-handler-open-failure-shape ()
+  "Opening a non-existent path returns the upstream open-failure shape.
+
+Per PROTOCOL.md Section 5, `read' open-failure is `cmd = \"read\"',
+`content = \"\"' (empty string, explicitly present), `code = 2'.  The
+shape is distinct from the generic error response."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-read-env dir
+    (let ((missing (expand-file-name "definitely-not-here.txt" dir)))
+      (setq firefox-to-emacs-native-messenger-read-whitelist '("*"))
+      (let ((response (firefox-to-emacs-native-messenger--read-handler
+                       nil `((cmd . "read") (file . ,missing)))))
+        (should (equal "read" (alist-get 'cmd response)))
+        (should (equal "" (alist-get 'content response)))
+        (should (= 2 (alist-get 'code response)))))))
+
+;;;; TASK-15800: dispatcher-to-handler wiring tests for the four sync cmds.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-dispatcher-registered-cmds ()
+  "All four synchronous v2 cmds are registered in the dispatcher table."
+  :tags '(:unit)
+  (dolist (cmd '("version" "getconfigpath" "temp" "read"))
+    (should (functionp
+             (gethash cmd firefox-to-emacs-native-messenger--handlers)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-dispatcher-unknown-cmd-still-unhandled ()
+  "Registration of the four sync cmds does not break the unknown-cmd path."
+  :tags '(:unit)
+  (let ((response (firefox-to-emacs-native-messenger--dispatch-request
+                   nil '((cmd . "not-a-real-cmd")))))
+    (should (equal "error" (alist-get 'cmd response)))
+    (should (equal "Unhandled message" (alist-get 'error response)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-dispatcher-routes-version ()
+  "The dispatcher invokes the `version' handler for a `version' request."
+  :tags '(:unit)
+  (let ((response (firefox-to-emacs-native-messenger--dispatch-request
+                   nil '((cmd . "version")))))
+    (should (equal "version" (alist-get 'cmd response)))
+    (should (= 0 (alist-get 'code response)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-dispatcher-routes-getconfigpath ()
+  "The dispatcher invokes the `getconfigpath' handler for that cmd."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+    (let ((firefox-to-emacs-native-messenger-rcpath-candidates
+           (list (expand-file-name "absent.rc" dir))))
+      (let ((response (firefox-to-emacs-native-messenger--dispatch-request
+                       nil '((cmd . "getconfigpath")))))
+        (should (equal "getconfigpath" (alist-get 'cmd response)))
+        (should (= 1 (alist-get 'code response)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-dispatcher-routes-temp ()
+  "The dispatcher invokes the `temp' handler for that cmd."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-temp-handler-env _tmp
+    (let ((response (firefox-to-emacs-native-messenger--dispatch-request
+                     nil '((cmd . "temp")
+                           (content . "x")
+                           (prefix . "t")))))
+      (should (equal "temp" (alist-get 'cmd response)))
+      (should (= 0 (alist-get 'code response))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-dispatcher-routes-read ()
+  "The dispatcher invokes the `read' handler for that cmd."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-read-env dir
+    (let ((path (expand-file-name "x.txt" dir)))
+      (with-temp-file path (insert "hello"))
+      (setq firefox-to-emacs-native-messenger-read-whitelist '("*"))
+      (let ((response (firefox-to-emacs-native-messenger--dispatch-request
+                       nil `((cmd . "read") (file . ,path)))))
+        (should (equal "read" (alist-get 'cmd response)))
+        (should (equal "hello" (alist-get 'content response)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-dispatcher-wire-roundtrip-version ()
+  "Full wire round-trip: send a framed `version' request, receive the response."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-listener-sandbox
+      _cache _tmp sock
+    (firefox-to-emacs-native-messenger-test--with-fresh-connection-registry
+     (firefox-to-emacs-native-messenger-start)
+     (let ((response (firefox-to-emacs-native-messenger-test-send-frame
+                      sock '((cmd . "version")))))
+       (should (equal "version" (alist-get 'cmd response)))
+       (should (= 0 (alist-get 'code response)))
+       (should (stringp (alist-get 'version response)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-dispatcher-wire-roundtrip-temp-then-read ()
+  "Full wire round-trip: temp creates a path, read returns its content."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-listener-sandbox
+      _cache _tmp sock
+    (firefox-to-emacs-native-messenger-test--with-fresh-connection-registry
+     (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+      (setq firefox-to-emacs-native-messenger-read-whitelist '("<TEMP-PATH>"))
+      (firefox-to-emacs-native-messenger-start)
+      (let* ((temp-response
+              (firefox-to-emacs-native-messenger-test-send-frame
+               sock '((cmd . "temp") (content . "round-trip-data") (prefix . "t"))))
+             (path (alist-get 'content temp-response))
+             (read-response
+              (firefox-to-emacs-native-messenger-test-send-frame
+               sock `((cmd . "read") (file . ,path)))))
+        (should (equal "temp" (alist-get 'cmd temp-response)))
+        (should (stringp path))
+        (should (equal "read" (alist-get 'cmd read-response)))
+        (should (equal "round-trip-data" (alist-get 'content read-response))))))))
+
+;;;; TASK-16000: capability-registry round-trip behavior tests.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-roundtrip-temp-read-ok ()
+  "Temp returns a path; subsequent read with `<TEMP-PATH>' in whitelist succeeds."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-listener-sandbox
+      _cache _tmp sock
+    (firefox-to-emacs-native-messenger-test--with-fresh-connection-registry
+     (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+      (setq firefox-to-emacs-native-messenger-read-whitelist '("<TEMP-PATH>"))
+      (firefox-to-emacs-native-messenger-start)
+      (let* ((temp-resp
+              (firefox-to-emacs-native-messenger-test-send-frame
+               sock '((cmd . "temp")
+                      (content . "registered content")
+                      (prefix . "host"))))
+             (path (alist-get 'content temp-resp))
+             (read-resp
+              (firefox-to-emacs-native-messenger-test-send-frame
+               sock `((cmd . "read") (file . ,path)))))
+        (should (equal "temp" (alist-get 'cmd temp-resp)))
+        (should (equal "read" (alist-get 'cmd read-resp)))
+        (should (equal "registered content"
+                       (alist-get 'content read-resp))))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-roundtrip-temp-unlink-then-read-rejects ()
+  "After the temp file is deleted, read produces \"path not in whitelist\".
+
+Prune-on-access kicks in inside the gate's `--registry-contains-p'
+check: the file's `file-attributes' fails, the registry entry is
+removed, and the gate match against `<TEMP-PATH>' fails."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-listener-sandbox
+      _cache _tmp sock
+    (firefox-to-emacs-native-messenger-test--with-fresh-connection-registry
+     (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+      (setq firefox-to-emacs-native-messenger-read-whitelist '("<TEMP-PATH>"))
+      (firefox-to-emacs-native-messenger-start)
+      (let* ((temp-resp
+              (firefox-to-emacs-native-messenger-test-send-frame
+               sock '((cmd . "temp") (content . "x") (prefix . "h"))))
+             (path (alist-get 'content temp-resp)))
+        (should (file-exists-p path))
+        (delete-file path)
+        (should-not (file-exists-p path))
+        (let ((read-resp
+               (firefox-to-emacs-native-messenger-test-send-frame
+                sock `((cmd . "read") (file . ,path)))))
+          (should (equal "error" (alist-get 'cmd read-resp)))
+          (should (equal "path not in whitelist"
+                         (alist-get 'error read-resp)))))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-roundtrip-restart-clears-registry ()
+  "After listener stop+start the previously-registered path is no longer admitted.
+
+Registry lifetime is bounded by a single listener lifetime per
+SEC-1200; a stop+start cycle clears the registry, so a previously
+registered path fails the `<TEMP-PATH>' gate even though the file may
+still exist on disk."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-listener-sandbox
+      _cache _tmp sock
+    (firefox-to-emacs-native-messenger-test--with-fresh-connection-registry
+     (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+      (setq firefox-to-emacs-native-messenger-read-whitelist '("<TEMP-PATH>"))
+      (firefox-to-emacs-native-messenger-start)
+      (let* ((temp-resp
+              (firefox-to-emacs-native-messenger-test-send-frame
+               sock '((cmd . "temp") (content . "x") (prefix . "h"))))
+             (path (alist-get 'content temp-resp)))
+        (should (file-exists-p path))
+        (firefox-to-emacs-native-messenger-stop)
+        (firefox-to-emacs-native-messenger-start)
+        ;; After the start-sweep the on-disk tempfile may be gone (FILE-1600
+        ;; is swept on listener start per PAT-0900).  The test does not
+        ;; depend on file existence; the registry-cleared-on-stop semantics
+        ;; means the gate rejects regardless of whether the file survived.
+        (let ((read-resp
+               (firefox-to-emacs-native-messenger-test-send-frame
+                sock `((cmd . "read") (file . ,path)))))
+          (should (equal "error" (alist-get 'cmd read-resp)))
+          (should (equal "path not in whitelist"
+                         (alist-get 'error read-resp)))))))))
+
 (provide 'firefox-to-emacs-native-messenger-tests)
 ;;; firefox-to-emacs-native-messenger-tests.el ends here
