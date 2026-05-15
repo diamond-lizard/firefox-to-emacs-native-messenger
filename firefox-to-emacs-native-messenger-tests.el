@@ -66,7 +66,7 @@
 ;; Real-subprocess helper:
 ;;   (firefox-to-emacs-native-messenger-test-run-shell-command COMMAND-STRING)
 ;;     -> (:exit-status N :stdout S)
-;;   Synchronously runs COMMAND-STRING under `setsid -- /bin/sh -c'.  Stderr
+;;   Synchronously runs COMMAND-STRING via `/bin/sh -c`.  Stderr
 ;;   is merged into stdout.  Output is captured and returned as a plist.
 ;;
 ;; Per-test cleanup convention:
@@ -402,16 +402,16 @@ compared with `equal'."
   "Run COMMAND-STRING in a subprocess and return (:exit-status N :stdout S).
 
 The subprocess is launched synchronously via `call-process' as
-`setsid -- /bin/sh -c COMMAND-STRING'.  Stderr is merged into stdout
+`/bin/sh -c COMMAND-STRING'.  Stderr is merged into stdout
 because `call-process' with a buffer DESTINATION captures both into the
 same buffer when DESTINATION is a single buffer.  Returns a plist."
   (let ((output-buffer (generate-new-buffer
                         " *firefox-to-emacs-native-messenger-test-run*")))
     (unwind-protect
-        (let ((exit (call-process "setsid" nil
+        (let ((exit (call-process "/bin/sh" nil
                                   (list output-buffer t)
                                   nil
-                                  "--" "/bin/sh" "-c" command-string)))
+                                  "-c" command-string)))
           (list :exit-status (if (integerp exit) exit -1)
                 :stdout (with-current-buffer output-buffer
                           (buffer-string))))
@@ -4954,6 +4954,1926 @@ still exist on disk."
           (should (equal "error" (alist-get 'cmd read-resp)))
           (should (equal "path not in whitelist"
                          (alist-get 'error read-resp)))))))))
+
+
+;;;; ============================================================
+;;;; Phase 0800: `run' handler, command-gate, and supporting helpers.
+;;;; ============================================================
+
+;;;; TASK-16500: command-gate FUNCTION tests.
+;;;; The gate function `--run-gate-match-p' consumes the
+;;;; `firefox-to-emacs-native-messenger-run-whitelist' defcustom and
+;;;; dispatches to `--command-gate-match-p' for individual entries.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-gate-empty-rejects ()
+  "Nil run-whitelist denies every candidate per REQ-3700.
+
+`nil' is the documented deny-all default; the gate must not even
+inspect the candidate string."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+   (setq firefox-to-emacs-native-messenger-run-whitelist nil)
+   (firefox-to-emacs-native-messenger-test--with-stub-registry '()
+     (should-not (firefox-to-emacs-native-messenger--run-gate-match-p "ls /"))
+     (should-not (firefox-to-emacs-native-messenger--run-gate-match-p ""))
+     (should-not (firefox-to-emacs-native-messenger--run-gate-match-p
+                  "emacsclient /tmp/foo")))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-gate-empty-list-rejects ()
+  "Empty list `()' is semantically equivalent to nil and denies every candidate."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+   (setq firefox-to-emacs-native-messenger-run-whitelist '())
+   (firefox-to-emacs-native-messenger-test--with-stub-registry '()
+     (should-not (firefox-to-emacs-native-messenger--run-gate-match-p
+                  "ls /home")))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-gate-allow-all-accepts ()
+  "Allow-all sentinel `(\"*\")' accepts every candidate without registry checks.
+
+REQ-3800 pins `(\"*\")' (a one-element list with the string \"*\") as
+the allow-all marker.  The gate must not consult the capability
+registry in this branch; the test stubs the registry to empty and
+still expects acceptance."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+   (setq firefox-to-emacs-native-messenger-run-whitelist '("*"))
+   (firefox-to-emacs-native-messenger-test--with-stub-registry '()
+     (should (firefox-to-emacs-native-messenger--run-gate-match-p "ls /"))
+     (should (firefox-to-emacs-native-messenger--run-gate-match-p "rm -rf /"))
+     (should (firefox-to-emacs-native-messenger--run-gate-match-p "")))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-gate-literal-entry-exact-match ()
+  "Entry with zero markers matches iff candidate equals entry byte-for-byte."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+   (setq firefox-to-emacs-native-messenger-run-whitelist '("ls /home"))
+   (firefox-to-emacs-native-messenger-test--with-stub-registry '()
+     (should (firefox-to-emacs-native-messenger--run-gate-match-p "ls /home"))
+     (should-not (firefox-to-emacs-native-messenger--run-gate-match-p
+                  "ls /home "))
+     (should-not (firefox-to-emacs-native-messenger--run-gate-match-p
+                  "ls /etc"))
+     (should-not (firefox-to-emacs-native-messenger--run-gate-match-p
+                  "ls /home extra")))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-gate-single-marker-registered ()
+  "Single-marker entry matches iff prefix/suffix and registry hit are all true."
+  :tags '(:unit :sandbox)
+  (let ((path "/tmp/firefox-to-emacs-native-messenger-tempfiles-1000/tmp_x.txt"))
+    (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+     (setq firefox-to-emacs-native-messenger-run-whitelist
+           '("emacsclient <TEMP-PATH>"))
+     (firefox-to-emacs-native-messenger-test--with-stub-registry (list path)
+       (should (firefox-to-emacs-native-messenger--run-gate-match-p
+                (concat "emacsclient " path)))
+       (should-not (firefox-to-emacs-native-messenger--run-gate-match-p
+                    (concat "vim " path)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-gate-single-marker-not-registered ()
+  "Single-marker entry rejects when the extracted substring is not in the registry."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+   (setq firefox-to-emacs-native-messenger-run-whitelist
+         '("emacsclient <TEMP-PATH>"))
+   (firefox-to-emacs-native-messenger-test--with-stub-registry '()
+     (should-not (firefox-to-emacs-native-messenger--run-gate-match-p
+                  "emacsclient /some/path.txt")))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-gate-quoted-marker-suffix ()
+  "Single-marker entry with a non-empty suffix literal also matches correctly.
+
+Tests the `rm -f \\='<TEMP-PATH>\\='' shape used by Tridactyl's
+`editor_rm' alias: prefix is `rm -f \\='', suffix is `\\='', and the
+extracted marker substring is whatever the candidate has between
+those literals."
+  :tags '(:unit :sandbox)
+  (let ((path "/tmp/foo.txt"))
+    (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+     (setq firefox-to-emacs-native-messenger-run-whitelist
+           '("rm -f '<TEMP-PATH>'"))
+     (firefox-to-emacs-native-messenger-test--with-stub-registry (list path)
+       (should (firefox-to-emacs-native-messenger--run-gate-match-p
+                (format "rm -f '%s'" path)))
+       (should-not (firefox-to-emacs-native-messenger--run-gate-match-p
+                    (format "rm -f \"%s\"" path)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-gate-multi-marker-all-registered ()
+  "Multi-marker entry accepts iff every extracted marker is in the registry."
+  :tags '(:unit :sandbox)
+  (let ((a "/tmp/a") (b "/tmp/b"))
+    (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+     (setq firefox-to-emacs-native-messenger-run-whitelist
+           '("cp <TEMP-PATH> <TEMP-PATH>"))
+     (firefox-to-emacs-native-messenger-test--with-stub-registry (list a b)
+       (should (firefox-to-emacs-native-messenger--run-gate-match-p
+                (concat "cp " a " " b))))
+     (firefox-to-emacs-native-messenger-test--with-stub-registry (list a)
+       (should-not (firefox-to-emacs-native-messenger--run-gate-match-p
+                    (concat "cp " a " " b)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-gate-trailing-bytes-reject ()
+  "Single-marker entry rejects when candidate has trailing bytes after the suffix.
+
+Per Section 8.10 the matcher requires the candidate to be fully
+consumed; a trailing `; rm -rf ~' after a registered path therefore
+rejects rather than being silently dropped."
+  :tags '(:unit :sandbox)
+  (let ((path "/tmp/foo.txt"))
+    (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+     (setq firefox-to-emacs-native-messenger-run-whitelist
+           '("emacsclient <TEMP-PATH>"))
+     (firefox-to-emacs-native-messenger-test--with-stub-registry (list path)
+       (should-not (firefox-to-emacs-native-messenger--run-gate-match-p
+                    (concat "emacsclient " path " ; rm -rf ~")))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-gate-multi-entry-any-match ()
+  "Multiple entries: gate accepts iff ANY entry matches the candidate."
+  :tags '(:unit :sandbox)
+  (let ((path "/tmp/x"))
+    (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+     (setq firefox-to-emacs-native-messenger-run-whitelist
+           '("emacsclient <TEMP-PATH>" "rm -f '<TEMP-PATH>'"))
+     (firefox-to-emacs-native-messenger-test--with-stub-registry (list path)
+       (should (firefox-to-emacs-native-messenger--run-gate-match-p
+                (concat "emacsclient " path)))
+       (should (firefox-to-emacs-native-messenger--run-gate-match-p
+                (format "rm -f '%s'" path)))
+       (should-not (firefox-to-emacs-native-messenger--run-gate-match-p
+                    (format "cat %s" path)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-gate-malformed-signals ()
+  "Per-gate validator at gate-check time signals `whitelist-malformed' on bad input.
+
+PAT-1100 site 3 re-validates the whitelist defcustom at every gate
+check.  The let-binding here intentionally bypasses the variable
+watcher's `:set' validator (PAT-1100 site 1), simulating a value
+that arrived via list mutation or other non-assignment path."
+  :tags '(:unit :sandbox)
+  (let ((firefox-to-emacs-native-messenger-run-whitelist
+         '("*" "/etc/oops")))
+    (should-error
+     (firefox-to-emacs-native-messenger--run-gate-match-p "ls /")
+     :type 'firefox-to-emacs-native-messenger-whitelist-malformed))
+  (let ((firefox-to-emacs-native-messenger-run-whitelist
+         '("rm <TMP-PATH>")))
+    (should-error
+     (firefox-to-emacs-native-messenger--run-gate-match-p "rm /tmp/x")
+     :type 'firefox-to-emacs-native-messenger-whitelist-malformed)))
+
+;;;; TASK-16700: terminal-cause CAS helper tests (PAT-0700).
+;;;; The CAS helper guarantees first-writer-wins semantics on a
+;;;; run-state's `terminal-cause' field; subsequent writes are no-ops.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-cas-terminal-cause-unset-to-set ()
+  "CAS on an unset state transitions the field and returns t.
+
+The first terminal observer to call CAS on the run-state wins and
+gets the t return so it knows it is responsible for the subsequent
+response-write step."
+  :tags '(:unit)
+  (let ((state (make-hash-table :test 'eq)))
+    (puthash 'terminal-cause nil state)
+    (should (firefox-to-emacs-native-messenger--run-state-cas-terminal-cause
+             state 'normal-zero))
+    (should (eq 'normal-zero (gethash 'terminal-cause state)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-cas-terminal-cause-already-set-noop ()
+  "CAS on an already-set state returns nil and does not mutate the field.
+
+The second-arriving terminal observer must NOT overwrite the
+first-writer's decision; the response shape is determined by the
+first cause that fires per PAT-0700."
+  :tags '(:unit)
+  (let ((state (make-hash-table :test 'eq)))
+    (puthash 'terminal-cause 'overflow state)
+    (should-not (firefox-to-emacs-native-messenger--run-state-cas-terminal-cause
+                 state 'normal-nonzero))
+    (should (eq 'overflow (gethash 'terminal-cause state)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-cas-terminal-cause-first-wins ()
+  "Two sequential CAS calls: the first wins; the second returns nil and no-ops.
+
+This is the documented `concurrent (simulated by sequencing two CAS
+calls) -> first wins' case in PAT-0700: under single-threaded ELisp
+semantics the sequencing is deterministic, and the helper guarantees
+that the second call sees the first's effect."
+  :tags '(:unit)
+  (let ((state (make-hash-table :test 'eq)))
+    (puthash 'terminal-cause nil state)
+    (should (firefox-to-emacs-native-messenger--run-state-cas-terminal-cause
+             state 'timeout))
+    (should-not (firefox-to-emacs-native-messenger--run-state-cas-terminal-cause
+                 state 'overflow))
+    (should (eq 'timeout (gethash 'terminal-cause state)))))
+
+;;;; TASK-16900: timer-cancel helper tests.
+;;;; The helper wraps `cancel-timer' with nil-tolerance so callers can
+;;;; pass possibly-nil timer slots from the run-state plist or per-
+;;;; connection plist without conditional logic at every callsite.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-cancel-timer-nil-noop ()
+  "Calling the cancel-timer helper with nil is a silent no-op.
+
+The run-state's `timeout-timer' field is nil when the run-timeout
+defcustom is unset; the helper must accept nil without error."
+  :tags '(:unit)
+  (should-not (firefox-to-emacs-native-messenger--cancel-timer nil)))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-cancel-timer-active-timer ()
+  "Calling the helper on an active timer cancels it.
+
+After cancellation the timer must NOT fire even after waiting past
+its scheduled time."
+  :tags '(:unit)
+  (let* ((fired nil)
+         (timer (run-at-time 0.05 nil (lambda () (setq fired t)))))
+    (firefox-to-emacs-native-messenger--cancel-timer timer)
+    (sleep-for 0.15)
+    (should-not fired)))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-cancel-timer-already-cancelled-noop ()
+  "Calling the helper twice on the same timer is a no-op the second time.
+
+Idempotency is required because multiple cleanup paths (subprocess
+sentinel, connection sentinel, signal-escalation) may all attempt
+to cancel the same timer; the helper must accept repeated calls."
+  :tags '(:unit)
+  (let ((timer (run-at-time 60 nil (lambda ()))))
+    (firefox-to-emacs-native-messenger--cancel-timer timer)
+    (firefox-to-emacs-native-messenger--cancel-timer timer)))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-cancel-timer-already-fired-noop ()
+  "Calling the helper on an already-fired timer is a silent no-op.
+
+After a timer fires it is removed from the active list; calling
+`cancel-timer' on it is implicitly a no-op, and our wrapper
+preserves that behavior."
+  :tags '(:unit)
+  (let* ((fired nil)
+         (timer (run-at-time 0.01 nil (lambda () (setq fired t)))))
+    (sleep-for 0.1)
+    (should fired)
+    (firefox-to-emacs-native-messenger--cancel-timer timer)))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-cancel-timer-non-timer-noop ()
+  "Calling the helper on a non-timer value is a silent no-op.
+
+Defensive guard against accidental nil-vs-timer confusion in upper
+layers: passing an integer or symbol should not crash the cleanup
+path."
+  :tags '(:unit)
+  (should-not (firefox-to-emacs-native-messenger--cancel-timer 42))
+  (should-not (firefox-to-emacs-native-messenger--cancel-timer 'not-a-timer))
+  (should-not (firefox-to-emacs-native-messenger--cancel-timer "string")))
+
+;;;; TASK-17100: signal-escalation helper tests (PAT-0800).
+;;;; The helper sends SIGINT to the negative pgrp; schedules SIGTERM
+;;;; after a configurable grace; schedules SIGKILL after a further
+;;;; grace; each escalation step checks `process-live-p' so a
+;;;; subprocess that exits early skips later signals.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-signal-escalate-nil-pgrp-noop ()
+  "With pgrp nil the escalation helper is a silent no-op.
+
+Defensive guard against partial state initialization (e.g., the
+subprocess died before `process-attributes' captured a pgrp and the
+fallback didn't populate either)."
+  :tags '(:unit)
+  (let ((state (make-hash-table :test 'eq)))
+    (puthash 'pgrp nil state)
+    (puthash 'subprocess nil state)
+    (should-not (firefox-to-emacs-native-messenger--run-signal-escalate state))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-signal-escalate-dead-subprocess-noop ()
+  "With a subprocess no longer live the escalation helper is a silent no-op.
+
+The connection-loss path may invoke escalation after the subprocess
+has already exited; the helper must accept that gracefully."
+  :tags '(:unit)
+  (let ((state (make-hash-table :test 'eq))
+        (dead-proc (make-process
+                    :name "fenm-test-escalate-dead"
+                    :command (list "/bin/sh" "-c" "true")
+                    :noquery t)))
+    (while (process-live-p dead-proc)
+      (accept-process-output dead-proc 0.05))
+    (puthash 'pgrp (process-id dead-proc) state)
+    (puthash 'subprocess dead-proc state)
+    (should-not
+     (firefox-to-emacs-native-messenger--run-signal-escalate state))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-signal-escalate-sigint-reaps-vanilla ()
+  "A vanilla sleeping subprocess is reaped by the SIGINT step.
+
+`/bin/sh -c \"sleep 30\"' exits on SIGINT directed at the
+pgrp; the SIGTERM and SIGKILL escalation steps `process-live-p'
+guards make them no-ops in this case."
+  :tags '(:integration :run-subprocess :slow)
+  (let* ((proc (make-process
+                :name "fenm-test-escalate-sigint-vanilla"
+                :command (list "/bin/sh" "-c" "sleep 30")
+                :coding 'binary
+                :stderr nil
+                :noquery t))
+         (state (make-hash-table :test 'eq))
+         (pid (process-id proc))
+         (pgrp (or (alist-get 'pgrp (process-attributes pid))
+                   pid)))
+    (unwind-protect
+        (let ((firefox-to-emacs-native-messenger-run-sigint-grace 0.5)
+              (firefox-to-emacs-native-messenger-run-sigterm-grace 0.5))
+          (puthash 'pgrp pgrp state)
+          (puthash 'subprocess proc state)
+          (firefox-to-emacs-native-messenger--run-signal-escalate state)
+          (let ((deadline (+ (float-time) 1.5)))
+            (while (and (process-live-p proc) (< (float-time) deadline))
+              (accept-process-output proc 0.05)))
+          (should-not (process-live-p proc)))
+      (when (process-live-p proc)
+        (ignore-errors (signal-process (- pgrp) 'kill))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-signal-escalate-sigterm-reaps-sigint-trapped ()
+  "A subprocess that traps SIGINT is reaped by the SIGTERM escalation step.
+
+The shell ignores SIGINT via `trap \\='\\=' INT'; the inherited
+disposition propagates to the sleep child.  When the SIGINT step
+fires, the pgrp-wide signal has no effect; the SIGTERM step then
+reaps both processes."
+  :tags '(:integration :run-subprocess :slow)
+  (let* ((proc (make-process
+                :name "fenm-test-escalate-sigint-trapped"
+                :command (list "/bin/sh" "-c"
+                               "trap '' INT; sleep 30")
+                :coding 'binary
+                :stderr nil
+                :noquery t))
+         (state (make-hash-table :test 'eq))
+         (pid (process-id proc))
+         (pgrp (or (alist-get 'pgrp (process-attributes pid))
+                   pid)))
+    (unwind-protect
+        (let ((firefox-to-emacs-native-messenger-run-sigint-grace 0.3)
+              (firefox-to-emacs-native-messenger-run-sigterm-grace 0.5))
+          (puthash 'pgrp pgrp state)
+          (puthash 'subprocess proc state)
+          (firefox-to-emacs-native-messenger--run-signal-escalate state)
+          (let ((deadline (+ (float-time) 2.0)))
+            (while (and (process-live-p proc) (< (float-time) deadline))
+              (accept-process-output proc 0.05)))
+          (should-not (process-live-p proc)))
+      (when (process-live-p proc)
+        (ignore-errors (signal-process (- pgrp) 'kill))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-signal-escalate-sigkill-reaps-sigterm-trapped ()
+  "A subprocess that traps SIGINT and SIGTERM is reaped by the SIGKILL step.
+
+The shell ignores both SIGINT and SIGTERM via `trap \\='\\=' INT TERM';
+SIGKILL is the only way out.  The escalation chain must reach the
+SIGKILL step within sigint-grace + sigterm-grace seconds."
+  :tags '(:integration :run-subprocess :slow)
+  (let* ((proc (make-process
+                :name "fenm-test-escalate-sigterm-trapped"
+                :command (list "/bin/sh" "-c"
+                               "trap '' INT TERM; sleep 30")
+                :coding 'binary
+                :stderr nil
+                :noquery t))
+         (state (make-hash-table :test 'eq))
+         (pid (process-id proc))
+         (pgrp (or (alist-get 'pgrp (process-attributes pid))
+                   pid)))
+    (unwind-protect
+        (let ((firefox-to-emacs-native-messenger-run-sigint-grace 0.3)
+              (firefox-to-emacs-native-messenger-run-sigterm-grace 0.3))
+          (puthash 'pgrp pgrp state)
+          (puthash 'subprocess proc state)
+          (firefox-to-emacs-native-messenger--run-signal-escalate state)
+          (let ((deadline (+ (float-time) 2.0)))
+            (while (and (process-live-p proc) (< (float-time) deadline))
+              (accept-process-output proc 0.05)))
+          (should-not (process-live-p proc)))
+      (when (process-live-p proc)
+        (ignore-errors (signal-process (- pgrp) 'kill))))))
+
+;;;; TASK-17300: run accumulator filter tests (REQ-2800 / PAT-0700).
+;;;; The accumulator filter is the subprocess-side process filter for
+;;;; the run handler.  It accumulates stdout+stderr bytes into the
+;;;; run-state's output-buffer, tracks output-bytes, and triggers the
+;;;; overflow CAS + signal-escalation path when output-bytes exceeds
+;;;; the captured output-cap.  The filter never emits a wire response.
+
+(defmacro firefox-to-emacs-native-messenger-test--with-run-state-on-subprocess
+    (state-var proc-var output-cap &rest body)
+  "Bind STATE-VAR to a fresh run-state, PROC-VAR to a sleep subprocess.
+
+Emacs creates each subprocess as its own session leader so its pgrp == pid; the
+state is populated with sensible defaults (terminal-cause unset,
+empty output-buffer, output-bytes 0, the given OUTPUT-CAP, and the
+subprocess + pgrp linkage).  PROC-VAR carries the run-state via
+its process plist key so the filter can resolve state from PROC.
+On body exit the subprocess is unconditionally killed via SIGKILL
+on its pgrp."
+  (declare (indent 3) (debug (symbolp symbolp form body)))
+  `(let* ((,proc-var (make-process
+                      :name "fenm-test-run-accum"
+                      :command (list "/bin/sh" "-c" "sleep 30")
+                      :coding 'binary
+                      :stderr nil
+                      :noquery t))
+          (,state-var (make-hash-table :test 'eq))
+          (pid (process-id ,proc-var))
+          (pgrp (or (alist-get 'pgrp (process-attributes pid)) pid)))
+     (unwind-protect
+         (progn
+           (puthash 'terminal-cause nil ,state-var)
+           (puthash 'output-buffer (unibyte-string) ,state-var)
+           (puthash 'output-bytes 0 ,state-var)
+           (puthash 'output-cap ,output-cap ,state-var)
+           (puthash 'subprocess ,proc-var ,state-var)
+           (puthash 'pgrp pgrp ,state-var)
+           (process-put ,proc-var
+                        firefox-to-emacs-native-messenger--subprocess-key-run-state
+                        ,state-var)
+           ,@body)
+       (when (process-live-p ,proc-var)
+         (ignore-errors (signal-process (- pgrp) 'kill))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-accumulator-filter-appends-bytes ()
+  "Filter appends incoming chunks to the output-buffer field and updates output-bytes."
+  :tags '(:integration :run-subprocess)
+  (firefox-to-emacs-native-messenger-test--with-run-state-on-subprocess
+      state proc 1024
+    (firefox-to-emacs-native-messenger--run-accumulator-filter proc "hello")
+    (should (equal "hello" (gethash 'output-buffer state)))
+    (should (= 5 (gethash 'output-bytes state)))
+    (firefox-to-emacs-native-messenger--run-accumulator-filter proc " world")
+    (should (equal "hello world" (gethash 'output-buffer state)))
+    (should (= 11 (gethash 'output-bytes state)))
+    ;; Terminal-cause must still be unset because we did not exceed cap.
+    (should-not (gethash 'terminal-cause state))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-accumulator-filter-overflow-triggers-cas ()
+  "Exceeding output-cap CAS-sets terminal-cause to overflow.
+
+The first observer to see output-bytes > output-cap claims the
+terminal cause; subsequent observers find it set."
+  :tags '(:integration :run-subprocess :slow)
+  (firefox-to-emacs-native-messenger-test--with-run-state-on-subprocess
+      state proc 10
+    (let ((firefox-to-emacs-native-messenger-run-sigint-grace 0.3)
+          (firefox-to-emacs-native-messenger-run-sigterm-grace 0.3))
+      (firefox-to-emacs-native-messenger--run-accumulator-filter
+       proc "this-chunk-exceeds-cap")
+      (should (eq 'overflow (gethash 'terminal-cause state)))
+      ;; Subprocess must terminate within the escalation budget.
+      (let ((deadline (+ (float-time) 2.0)))
+        (while (and (process-live-p proc) (< (float-time) deadline))
+          (accept-process-output proc 0.05)))
+      (should-not (process-live-p proc)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-accumulator-filter-overflow-once ()
+  "When terminal-cause is already set, filter does NOT re-invoke escalation.
+
+CAS guarantees first-writer-wins; subsequent filter invocations
+that would have triggered overflow find the cause already set and
+skip the escalation step.  Verified by stubbing escalate to count
+calls."
+  :tags '(:integration :run-subprocess)
+  (firefox-to-emacs-native-messenger-test--with-run-state-on-subprocess
+      state proc 10
+    (puthash 'terminal-cause 'overflow state)
+    (let ((escalate-calls 0))
+      (cl-letf (((symbol-function
+                  'firefox-to-emacs-native-messenger--run-signal-escalate)
+                 (lambda (_state) (cl-incf escalate-calls))))
+        (firefox-to-emacs-native-messenger--run-accumulator-filter
+         proc "this-chunk-exceeds-cap-twice")
+        (should (= 0 escalate-calls))
+        (should (eq 'overflow (gethash 'terminal-cause state)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-accumulator-filter-no-run-state-noop ()
+  "If the subprocess has no run-state on its plist, the filter is a silent no-op.
+
+Defensive guard against partial initialization (e.g., the handler
+attached the filter but errored before populating the run-state)."
+  :tags '(:integration :run-subprocess)
+  (let ((proc (make-process
+               :name "fenm-test-accum-no-state"
+               :command (list "/bin/sh" "-c" "exec sleep 30")
+               :coding 'binary
+               :stderr nil
+               :noquery t)))
+    (unwind-protect
+        (progn
+          (should-not
+           (process-get proc
+                        firefox-to-emacs-native-messenger--subprocess-key-run-state))
+          (should-not
+           (firefox-to-emacs-native-messenger--run-accumulator-filter
+            proc "anything")))
+      (when (process-live-p proc)
+        (ignore-errors (signal-process (- (process-id proc)) 'kill))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-accumulator-filter-zero-byte-chunks-ok ()
+  "A zero-byte chunk is appended without errors and does not advance counters.
+
+Defensive guard for synthetic test inputs and rare empty-write
+scenarios from the subprocess side."
+  :tags '(:integration :run-subprocess)
+  (firefox-to-emacs-native-messenger-test--with-run-state-on-subprocess
+      state proc 100
+    (firefox-to-emacs-native-messenger--run-accumulator-filter proc "")
+    (should (equal "" (gethash 'output-buffer state)))
+    (should (= 0 (gethash 'output-bytes state)))
+    (should-not (gethash 'terminal-cause state))))
+
+;;;; TASK-17500: run subprocess sentinel tests (PAT-0700).
+;;;; The sentinel observes subprocess exit, CAS-sets terminal-cause to
+;;;; `normal-zero' or `normal-nonzero' based on exit status if not set,
+;;;; cancels any pending timeout-timer, and dispatches the wire
+;;;; response according to the final `terminal-cause' value.  No
+;;;; response is sent when `terminal-cause' is `connection-loss'.
+
+(defmacro firefox-to-emacs-native-messenger-test--with-completed-subprocess
+    (proc-var command-list &rest body)
+  "Bind PROC-VAR to a subprocess running COMMAND-LIST; wait for exit; run BODY.
+
+The subprocess's coding is `binary' and `:stderr nil' so its output
+capture conventions match the production run handler's invocation."
+  (declare (indent 2) (debug (symbolp form body)))
+  `(let ((,proc-var (make-process
+                     :name "fenm-test-completed-sub"
+                     :command ,command-list
+                     :coding 'binary
+                     :stderr nil
+                     :noquery t)))
+     (unwind-protect
+         (progn
+           (let ((deadline (+ (float-time) 2.0)))
+             (while (and (process-live-p ,proc-var) (< (float-time) deadline))
+               (accept-process-output ,proc-var 0.05)))
+           ,@body)
+       (when (process-live-p ,proc-var)
+         (ignore-errors (signal-process (process-id ,proc-var) 'kill))))))
+
+(defmacro firefox-to-emacs-native-messenger-test--with-run-sentinel-fixture
+    (state-var sub-var conn-var captured-var command-list &rest body)
+  "Configure a run-state and stub write-response for a sentinel test.
+
+CONN-VAR is a live `sleep 30' subprocess used as a stand-in for the
+listener-side connection so the sentinel sees a live process and
+forwards the response object to the stubbed
+`firefox-to-emacs-native-messenger--write-response'.  Calls to the
+writer are collected into CAPTURED-VAR as (CONN . RESPONSE) pairs.
+
+CONN-VAR is launched OUTSIDE the run-state's pgrp so the subprocess
+escalation chain (if it fires) cannot affect it."
+  (declare (indent 5) (debug (symbolp symbolp symbolp symbolp form body)))
+  `(let ((,conn-var (make-process
+                     :name "fenm-test-conn-proxy"
+                     :command (list "/bin/sh" "-c" "exec sleep 30")
+                     :coding 'binary
+                     :stderr nil
+                     :noquery t))
+         (,captured-var '()))
+     (unwind-protect
+         (firefox-to-emacs-native-messenger-test--with-completed-subprocess
+             ,sub-var ,command-list
+           (let ((,state-var (make-hash-table :test 'eq)))
+             (puthash 'terminal-cause nil ,state-var)
+             (puthash 'output-buffer (unibyte-string) ,state-var)
+             (puthash 'output-bytes 0 ,state-var)
+             (puthash 'output-cap 1024 ,state-var)
+             (puthash 'subprocess ,sub-var ,state-var)
+             (puthash 'connection ,conn-var ,state-var)
+             (puthash 'command-string "test-cmd" ,state-var)
+             (puthash 'pgrp (process-id ,sub-var) ,state-var)
+             (puthash 'timeout-timer nil ,state-var)
+             (process-put ,sub-var
+                          firefox-to-emacs-native-messenger--subprocess-key-run-state
+                          ,state-var)
+             (cl-letf (((symbol-function
+                         'firefox-to-emacs-native-messenger--write-response)
+                        (lambda (c r) (push (cons c r) ,captured-var))))
+               ,@body)))
+       (when (process-live-p ,conn-var)
+         (ignore-errors (signal-process (process-id ,conn-var) 'kill))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-sentinel-normal-zero-exit ()
+  "A subprocess exit with code 0 and no prior terminal-cause CAS-sets normal-zero.
+
+The sentinel must build a response with `cmd' = \"run\", echoed
+`command', present `content' (possibly empty), and `code' = 0."
+  :tags '(:integration :run-subprocess)
+  (firefox-to-emacs-native-messenger-test--with-run-sentinel-fixture
+      state sub conn captured (list "/bin/sh" "-c" "true")
+    (firefox-to-emacs-native-messenger--run-subprocess-sentinel
+     sub "finished\n")
+    (should (eq 'normal-zero (gethash 'terminal-cause state)))
+    (should (= 1 (length captured)))
+    (let* ((entry (car captured))
+           (response (cdr entry)))
+      (should (eq conn (car entry)))
+      (should (equal "run" (alist-get 'cmd response)))
+      (should (equal "test-cmd" (alist-get 'command response)))
+      (should (equal "" (alist-get 'content response)))
+      (should (= 0 (alist-get 'code response))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-sentinel-normal-nonzero-exit ()
+  "A subprocess exit with non-zero code CAS-sets `normal-nonzero'.
+
+The response's `code' field carries the actual exit status."
+  :tags '(:integration :run-subprocess)
+  (firefox-to-emacs-native-messenger-test--with-run-sentinel-fixture
+      state sub conn captured (list "/bin/sh" "-c" "exit 7")
+    (firefox-to-emacs-native-messenger--run-subprocess-sentinel
+     sub "exited\n")
+    (should (eq 'normal-nonzero (gethash 'terminal-cause state)))
+    (should (= 1 (length captured)))
+    (let ((response (cdr (car captured))))
+      (should (equal "run" (alist-get 'cmd response)))
+      (should (= 7 (alist-get 'code response))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-sentinel-connection-loss-no-response ()
+  "When terminal-cause is `connection-loss', the sentinel sends NO response.
+
+The connection has been torn down by the connection sentinel; the
+run subprocess sentinel must log and bail out without invoking the
+response writer."
+  :tags '(:integration :run-subprocess)
+  (firefox-to-emacs-native-messenger-test--with-run-sentinel-fixture
+      state sub conn captured (list "/bin/sh" "-c" "true")
+    (puthash 'terminal-cause 'connection-loss state)
+    (firefox-to-emacs-native-messenger--run-subprocess-sentinel
+     sub "finished\n")
+    (should (eq 'connection-loss (gethash 'terminal-cause state)))
+    (should (null captured))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-sentinel-overflow-error-response ()
+  "When terminal-cause is `overflow', the response is the generic too-large error.
+
+The wording is the shared `response too large' string used for
+both run-side overflow and the writer's post-serialize over-cap
+replacement (PROTOCOL.md Section 11)."
+  :tags '(:integration :run-subprocess)
+  (firefox-to-emacs-native-messenger-test--with-run-sentinel-fixture
+      state sub conn captured (list "/bin/sh" "-c" "true")
+    (puthash 'terminal-cause 'overflow state)
+    (firefox-to-emacs-native-messenger--run-subprocess-sentinel
+     sub "finished\n")
+    (should (= 1 (length captured)))
+    (let ((response (cdr (car captured))))
+      (should (equal "error" (alist-get 'cmd response)))
+      (should (equal "response too large" (alist-get 'error response))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-sentinel-timeout-error-response ()
+  "When terminal-cause is `timeout', the response carries the timeout wording.
+
+The wording is `run timeout exceeded' per PROTOCOL.md Section 15."
+  :tags '(:integration :run-subprocess)
+  (firefox-to-emacs-native-messenger-test--with-run-sentinel-fixture
+      state sub conn captured (list "/bin/sh" "-c" "true")
+    (puthash 'terminal-cause 'timeout state)
+    (firefox-to-emacs-native-messenger--run-subprocess-sentinel
+     sub "finished\n")
+    (should (= 1 (length captured)))
+    (let ((response (cdr (car captured))))
+      (should (equal "error" (alist-get 'cmd response)))
+      (should (equal "run timeout exceeded" (alist-get 'error response))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-sentinel-cancels-timeout-timer ()
+  "The sentinel cancels the run-state's `timeout-timer' on subprocess exit.
+
+After the sentinel runs, the timer must NOT fire even after its
+scheduled time elapses; the state's `timeout-timer' field is
+cleared to nil."
+  :tags '(:integration :run-subprocess)
+  (firefox-to-emacs-native-messenger-test--with-run-sentinel-fixture
+      state sub conn captured (list "/bin/sh" "-c" "true")
+    (let ((fired nil))
+      (puthash 'timeout-timer
+               (run-at-time 0.1 nil (lambda () (setq fired t)))
+               state)
+      (firefox-to-emacs-native-messenger--run-subprocess-sentinel
+       sub "finished\n")
+      (should-not (gethash 'timeout-timer state))
+      (sleep-for 0.2)
+      (should-not fired))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-sentinel-output-buffer-in-response ()
+  "The captured output-buffer becomes the response's `content' field.
+
+Verifies the byte-faithful capture per Section 10.2: bytes the
+subprocess wrote (and the accumulator filter captured) appear in
+the response's content."
+  :tags '(:integration :run-subprocess)
+  (firefox-to-emacs-native-messenger-test--with-run-sentinel-fixture
+      state sub conn captured (list "/bin/sh" "-c" "true")
+    (puthash 'output-buffer "hello\n" state)
+    (puthash 'output-bytes 6 state)
+    (firefox-to-emacs-native-messenger--run-subprocess-sentinel
+     sub "finished\n")
+    (let ((response (cdr (car captured))))
+      (should (equal "hello\n" (alist-get 'content response))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-sentinel-skips-intermediate-events ()
+  "The sentinel ignores non-terminal events; only acts on exit/signal status."
+  :tags '(:integration :run-subprocess)
+  (let ((proc (make-process
+               :name "fenm-test-sentinel-skips"
+               :command (list "/bin/sh" "-c" "exec sleep 30")
+               :coding 'binary
+               :stderr nil
+               :noquery t))
+        (captured '()))
+    (unwind-protect
+        (let ((state (make-hash-table :test 'eq)))
+          (puthash 'terminal-cause nil state)
+          (puthash 'output-buffer (unibyte-string) state)
+          (puthash 'output-bytes 0 state)
+          (puthash 'output-cap 1024 state)
+          (puthash 'subprocess proc state)
+          (puthash 'connection proc state)
+          (puthash 'command-string "sleep 30" state)
+          (puthash 'pgrp (process-id proc) state)
+          (puthash 'timeout-timer nil state)
+          (process-put proc
+                       firefox-to-emacs-native-messenger--subprocess-key-run-state
+                       state)
+          (cl-letf (((symbol-function
+                      'firefox-to-emacs-native-messenger--write-response)
+                     (lambda (c r) (push (cons c r) captured))))
+            (firefox-to-emacs-native-messenger--run-subprocess-sentinel
+             proc "open from foo\n")
+            (should-not (gethash 'terminal-cause state))
+            (should (null captured))))
+      (when (process-live-p proc)
+        (ignore-errors (signal-process (process-id proc) 'kill))))))
+
+;;;; TASK-17700: run-timeout timer tests.
+;;;; The timer is scheduled iff the `run-timeout' defcustom is non-nil.
+;;;; On expiration it CAS-sets `terminal-cause' to `timeout' and
+;;;; invokes signal-escalation; the subprocess sentinel observes the
+;;;; subsequent exit and builds the `run timeout exceeded' error.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-timeout-schedule-nil-noop ()
+  "When the run-timeout defcustom is nil, the schedule helper is a no-op.
+
+The state's `timeout-timer' field remains nil and no callback is
+ever queued."
+  :tags '(:unit)
+  (let ((state (make-hash-table :test 'eq))
+        (firefox-to-emacs-native-messenger-run-timeout nil))
+    (puthash 'timeout-timer nil state)
+    (firefox-to-emacs-native-messenger--run-timeout-schedule state)
+    (should-not (gethash 'timeout-timer state))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-timeout-schedule-zero-noop ()
+  "A zero or negative timeout is treated as `disabled' (defensive)."
+  :tags '(:unit)
+  (let ((state (make-hash-table :test 'eq)))
+    (puthash 'timeout-timer nil state)
+    (let ((firefox-to-emacs-native-messenger-run-timeout 0))
+      (firefox-to-emacs-native-messenger--run-timeout-schedule state)
+      (should-not (gethash 'timeout-timer state)))
+    (let ((firefox-to-emacs-native-messenger-run-timeout -1))
+      (firefox-to-emacs-native-messenger--run-timeout-schedule state)
+      (should-not (gethash 'timeout-timer state)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-timeout-schedule-creates-timer ()
+  "Setting the defcustom to a positive number installs an active timer."
+  :tags '(:unit)
+  (let ((state (make-hash-table :test 'eq))
+        (firefox-to-emacs-native-messenger-run-timeout 60))
+    (puthash 'timeout-timer nil state)
+    (unwind-protect
+        (progn
+          (firefox-to-emacs-native-messenger--run-timeout-schedule state)
+          (should (timerp (gethash 'timeout-timer state))))
+      (firefox-to-emacs-native-messenger--cancel-timer
+       (gethash 'timeout-timer state)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-timeout-expire-cas-and-escalate ()
+  "The expire handler CAS-sets `terminal-cause' to timeout AND invokes escalate."
+  :tags '(:unit)
+  (let ((state (make-hash-table :test 'eq))
+        (escalate-calls 0))
+    (puthash 'terminal-cause nil state)
+    (puthash 'subprocess nil state)
+    (cl-letf (((symbol-function
+                'firefox-to-emacs-native-messenger--run-signal-escalate)
+               (lambda (_state) (cl-incf escalate-calls))))
+      (firefox-to-emacs-native-messenger--run-timeout-expire state)
+      (should (eq 'timeout (gethash 'terminal-cause state)))
+      (should (= 1 escalate-calls)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-timeout-expire-already-set-no-escalate ()
+  "When `terminal-cause' is already set, expire does NOT re-escalate.
+
+CAS returns nil; the helper short-circuits before calling escalate."
+  :tags '(:unit)
+  (let ((state (make-hash-table :test 'eq))
+        (escalate-calls 0))
+    (puthash 'terminal-cause 'normal-zero state)
+    (cl-letf (((symbol-function
+                'firefox-to-emacs-native-messenger--run-signal-escalate)
+               (lambda (_state) (cl-incf escalate-calls))))
+      (firefox-to-emacs-native-messenger--run-timeout-expire state)
+      (should (eq 'normal-zero (gethash 'terminal-cause state)))
+      (should (= 0 escalate-calls)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-timeout-end-to-end ()
+  "End-to-end: scheduled timer fires, signals subprocess, sets terminal-cause.
+
+The subprocess is `sleep 30' (Emacs makes each subprocess its own session leader); the timeout is 0.2 seconds.
+Within ~2 seconds (timeout + sigint-grace + sigterm-grace + buffer)
+the subprocess must be terminated and `terminal-cause' must be
+`timeout'."
+  :tags '(:integration :run-subprocess :slow)
+  (let* ((proc (make-process
+                :name "fenm-test-timeout-e2e"
+                :command (list "/bin/sh" "-c" "sleep 30")
+                :coding 'binary
+                :stderr nil
+                :noquery t))
+         (state (make-hash-table :test 'eq))
+         (pid (process-id proc))
+         (pgrp (or (alist-get 'pgrp (process-attributes pid)) pid)))
+    (unwind-protect
+        (let ((firefox-to-emacs-native-messenger-run-timeout 0.2)
+              (firefox-to-emacs-native-messenger-run-sigint-grace 0.3)
+              (firefox-to-emacs-native-messenger-run-sigterm-grace 0.3))
+          (puthash 'terminal-cause nil state)
+          (puthash 'subprocess proc state)
+          (puthash 'pgrp pgrp state)
+          (puthash 'timeout-timer nil state)
+          (firefox-to-emacs-native-messenger--run-timeout-schedule state)
+          (should (timerp (gethash 'timeout-timer state)))
+          (let ((deadline (+ (float-time) 2.0)))
+            (while (and (process-live-p proc) (< (float-time) deadline))
+              (accept-process-output proc 0.05)))
+          (should-not (process-live-p proc))
+          (should (eq 'timeout (gethash 'terminal-cause state))))
+      (when (process-live-p proc)
+        (ignore-errors (signal-process (- pgrp) 'kill)))
+      (firefox-to-emacs-native-messenger--cancel-timer
+       (gethash 'timeout-timer state)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-timeout-cancelable ()
+  "A scheduled timer can be cancelled via the cancel-timer helper before firing.
+
+The cancelled timer does NOT fire even after its scheduled time elapses."
+  :tags '(:integration :run-subprocess :slow)
+  (let ((state (make-hash-table :test 'eq))
+        (escalate-calls 0))
+    (puthash 'terminal-cause nil state)
+    (puthash 'subprocess nil state)
+    (cl-letf (((symbol-function
+                'firefox-to-emacs-native-messenger--run-signal-escalate)
+               (lambda (_s) (cl-incf escalate-calls))))
+      (let ((firefox-to-emacs-native-messenger-run-timeout 0.2))
+        (firefox-to-emacs-native-messenger--run-timeout-schedule state)
+        (should (timerp (gethash 'timeout-timer state)))
+        (firefox-to-emacs-native-messenger--cancel-timer
+         (gethash 'timeout-timer state))
+        (sleep-for 0.4)
+        (should (= 0 escalate-calls))
+        (should-not (gethash 'terminal-cause state))))))
+
+;;;; TASK-17900: connection-sentinel run-cancellation extension tests.
+;;;; When peer close arrives while the connection state is `dispatched',
+;;;; the sentinel must locate the linked run subprocess, CAS-set its
+;;;; terminal-cause to `connection-loss', cancel any pending
+;;;; timeout-timer, and invoke signal-escalation per PAT-0800.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-connection-sentinel-cancels-run-on-peer-close ()
+  "Peer close in dispatched state CAS-sets connection-loss and escalates the run.
+
+Sets up a connection (live process) linked via the
+`run-subprocess' plist key to a long-running shell subprocess; populates a
+run-state with `terminal-cause' nil and a pgrp; sets the
+connection's state to `dispatched'; calls the connection sentinel
+with a close-event string; asserts the run-state's terminal-cause
+becomes `connection-loss', the stubbed signal-escalate was called
+exactly once, and the connection state transitioned to `closing'."
+  :tags '(:integration :run-subprocess)
+  (firefox-to-emacs-native-messenger-test--with-fresh-connection-registry
+   (let* ((conn (make-process
+                 :name "fenm-test-conn-sentinel-cancel"
+                 :command (list "/bin/sh" "-c" "exec sleep 30")
+                 :coding 'binary :stderr nil :noquery t))
+          (sub (make-process
+                :name "fenm-test-sub-sentinel-cancel"
+                :command (list "/bin/sh" "-c" "sleep 30")
+                :coding 'binary :stderr nil :noquery t))
+          (state (make-hash-table :test 'eq))
+          (escalate-calls 0))
+     (unwind-protect
+         (progn
+           (puthash 'terminal-cause nil state)
+           (puthash 'subprocess sub state)
+           (puthash 'pgrp (process-id sub) state)
+           (puthash 'timeout-timer nil state)
+           (process-put sub
+                        firefox-to-emacs-native-messenger--subprocess-key-run-state
+                        state)
+           (process-put conn
+                        firefox-to-emacs-native-messenger--connection-key-run-subprocess
+                        sub)
+           (process-put conn
+                        firefox-to-emacs-native-messenger--connection-key-state
+                        'dispatched)
+           (puthash conn t
+                    firefox-to-emacs-native-messenger--connection-registry)
+           (cl-letf (((symbol-function
+                       'firefox-to-emacs-native-messenger--run-signal-escalate)
+                      (lambda (_s) (cl-incf escalate-calls))))
+             (firefox-to-emacs-native-messenger--connection-sentinel
+              conn "finished\n"))
+           (should (eq 'connection-loss (gethash 'terminal-cause state)))
+           (should (= 1 escalate-calls))
+           (should (eq 'closing
+                       (process-get
+                        conn
+                        firefox-to-emacs-native-messenger--connection-key-state)))
+           (should-not (gethash
+                        conn
+                        firefox-to-emacs-native-messenger--connection-registry)))
+       (when (process-live-p conn)
+         (ignore-errors (signal-process (process-id conn) 'kill)))
+       (when (process-live-p sub)
+         (ignore-errors (signal-process (process-id sub) 'kill)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-connection-sentinel-cancels-run-cancels-timeout-timer ()
+  "Run-cancellation extension cancels any pending run-timeout timer.
+
+After the sentinel runs, the run-state's `timeout-timer' field is
+cleared and the timer is no longer in the active timer list."
+  :tags '(:integration :run-subprocess :slow)
+  (firefox-to-emacs-native-messenger-test--with-fresh-connection-registry
+   (let* ((conn (make-process
+                 :name "fenm-test-conn-sentinel-cancels-timer"
+                 :command (list "/bin/sh" "-c" "exec sleep 30")
+                 :coding 'binary :stderr nil :noquery t))
+          (sub (make-process
+                :name "fenm-test-sub-sentinel-cancels-timer"
+                :command (list "/bin/sh" "-c" "sleep 30")
+                :coding 'binary :stderr nil :noquery t))
+          (state (make-hash-table :test 'eq))
+          (timer-fired nil))
+     (unwind-protect
+         (progn
+           (puthash 'terminal-cause nil state)
+           (puthash 'subprocess sub state)
+           (puthash 'pgrp (process-id sub) state)
+           (puthash 'timeout-timer
+                    (run-at-time 0.2 nil (lambda () (setq timer-fired t)))
+                    state)
+           (process-put sub
+                        firefox-to-emacs-native-messenger--subprocess-key-run-state
+                        state)
+           (process-put conn
+                        firefox-to-emacs-native-messenger--connection-key-run-subprocess
+                        sub)
+           (process-put conn
+                        firefox-to-emacs-native-messenger--connection-key-state
+                        'dispatched)
+           (puthash conn t
+                    firefox-to-emacs-native-messenger--connection-registry)
+           (cl-letf (((symbol-function
+                       'firefox-to-emacs-native-messenger--run-signal-escalate)
+                      (lambda (_s) nil)))
+             (firefox-to-emacs-native-messenger--connection-sentinel
+              conn "finished\n"))
+           (should-not (gethash 'timeout-timer state))
+           (sleep-for 0.3)
+           (should-not timer-fired))
+       (when (process-live-p conn)
+         (ignore-errors (signal-process (process-id conn) 'kill)))
+       (when (process-live-p sub)
+         (ignore-errors (signal-process (process-id sub) 'kill)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-connection-sentinel-no-link-noop ()
+  "Peer close in dispatched state with NO linked subprocess is a silent no-op.
+
+Defensive guard: if the `run-subprocess' plist key is unset on the
+connection (e.g., the run handler errored before linkage), the
+sentinel must not crash and must not invoke escalate."
+  :tags '(:integration :run-subprocess)
+  (firefox-to-emacs-native-messenger-test--with-fresh-connection-registry
+   (let ((conn (make-process
+                :name "fenm-test-conn-sentinel-no-link"
+                :command (list "/bin/sh" "-c" "exec sleep 30")
+                :coding 'binary :stderr nil :noquery t))
+         (escalate-calls 0))
+     (unwind-protect
+         (progn
+           (process-put conn
+                        firefox-to-emacs-native-messenger--connection-key-state
+                        'dispatched)
+           (puthash conn t
+                    firefox-to-emacs-native-messenger--connection-registry)
+           (cl-letf (((symbol-function
+                       'firefox-to-emacs-native-messenger--run-signal-escalate)
+                      (lambda (_s) (cl-incf escalate-calls))))
+             (firefox-to-emacs-native-messenger--connection-sentinel
+              conn "finished\n"))
+           (should (= 0 escalate-calls))
+           (should (eq 'closing
+                       (process-get
+                        conn
+                        firefox-to-emacs-native-messenger--connection-key-state))))
+       (when (process-live-p conn)
+         (ignore-errors (signal-process (process-id conn) 'kill)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-connection-sentinel-non-dispatched-no-cancel ()
+  "Peer close when prior state is NOT `dispatched' does NOT trigger run cancellation.
+
+The run-cancellation extension only fires when a deferred-response
+run is in flight."
+  :tags '(:integration :run-subprocess)
+  (firefox-to-emacs-native-messenger-test--with-fresh-connection-registry
+   (let ((conn (make-process
+                :name "fenm-test-conn-sentinel-non-dispatched"
+                :command (list "/bin/sh" "-c" "exec sleep 30")
+                :coding 'binary :stderr nil :noquery t))
+         (escalate-calls 0))
+     (unwind-protect
+         (progn
+           (process-put conn
+                        firefox-to-emacs-native-messenger--connection-key-state
+                        'reading)
+           (puthash conn t
+                    firefox-to-emacs-native-messenger--connection-registry)
+           (cl-letf (((symbol-function
+                       'firefox-to-emacs-native-messenger--run-signal-escalate)
+                      (lambda (_s) (cl-incf escalate-calls))))
+             (firefox-to-emacs-native-messenger--connection-sentinel
+              conn "finished\n"))
+           (should (= 0 escalate-calls)))
+       (when (process-live-p conn)
+         (ignore-errors (signal-process (process-id conn) 'kill)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-connection-sentinel-cancel-after-cause-set ()
+  "If terminal-cause is already set when peer-close arrives, escalate is NOT re-invoked.
+
+Defensive: the first terminal observer wins via CAS; the
+connection sentinel's helper acknowledges the loss via log but
+skips escalate."
+  :tags '(:integration :run-subprocess)
+  (firefox-to-emacs-native-messenger-test--with-fresh-connection-registry
+   (let* ((conn (make-process
+                 :name "fenm-test-conn-sentinel-cause-set"
+                 :command (list "/bin/sh" "-c" "exec sleep 30")
+                 :coding 'binary :stderr nil :noquery t))
+          (sub (make-process
+                :name "fenm-test-sub-sentinel-cause-set"
+                :command (list "/bin/sh" "-c" "sleep 30")
+                :coding 'binary :stderr nil :noquery t))
+          (state (make-hash-table :test 'eq))
+          (escalate-calls 0))
+     (unwind-protect
+         (progn
+           (puthash 'terminal-cause 'overflow state)
+           (puthash 'subprocess sub state)
+           (puthash 'pgrp (process-id sub) state)
+           (puthash 'timeout-timer nil state)
+           (process-put sub
+                        firefox-to-emacs-native-messenger--subprocess-key-run-state
+                        state)
+           (process-put conn
+                        firefox-to-emacs-native-messenger--connection-key-run-subprocess
+                        sub)
+           (process-put conn
+                        firefox-to-emacs-native-messenger--connection-key-state
+                        'dispatched)
+           (puthash conn t
+                    firefox-to-emacs-native-messenger--connection-registry)
+           (cl-letf (((symbol-function
+                       'firefox-to-emacs-native-messenger--run-signal-escalate)
+                      (lambda (_s) (cl-incf escalate-calls))))
+             (firefox-to-emacs-native-messenger--connection-sentinel
+              conn "finished\n"))
+           (should (eq 'overflow (gethash 'terminal-cause state)))
+           (should (= 0 escalate-calls)))
+       (when (process-live-p conn)
+         (ignore-errors (signal-process (process-id conn) 'kill)))
+       (when (process-live-p sub)
+         (ignore-errors (signal-process (process-id sub) 'kill)))))))
+
+;;;; TASK-18100: run handler end-to-end tests.
+;;;; The handler must launch via /bin/sh -c (Emacs makes each subprocess its own session leader), capture pgrp
+;;;; (with fallback to PID), populate the run-state hash table, set up
+;;;; the cross-link between connection and subprocess, transition the
+;;;; connection state to `dispatched', schedule the run-timeout timer
+;;;; if configured, and send any content followed by EOF to stdin
+;;;; (EPIPE tolerated and logged).
+
+(defmacro firefox-to-emacs-native-messenger-test--with-stub-connection
+    (conn-var &rest body)
+  "Bind CONN-VAR to a live shell-stub process suitable as a fake connection.
+
+The process is `exec sleep 60' under /bin/sh so it sits idle until
+the test completes; on body exit it is unconditionally killed."
+  (declare (indent 1) (debug (symbolp body)))
+  `(let ((,conn-var (make-process
+                     :name "fenm-test-stub-conn"
+                     :command (list "/bin/sh" "-c" "exec sleep 60")
+                     :coding 'binary :stderr nil :noquery t)))
+     (unwind-protect
+         (progn ,@body)
+       (when (process-live-p ,conn-var)
+         (ignore-errors (signal-process (process-id ,conn-var) 'kill))))))
+
+(defmacro firefox-to-emacs-native-messenger-test--with-run-handler-fixture
+    (client-var run-whitelist &rest body)
+  "Set up an allow-all (or supplied) run-whitelist plus a stub connection.
+
+CLIENT-VAR is bound to a stub connection process (see
+`--with-stub-connection').  The run-whitelist defcustom is
+saved/restored around BODY; RUN-WHITELIST is the value used inside
+the test.  Calls to `--write-response' are stubbed to a no-op so a
+spuriously-firing sentinel does not write to the stub connection."
+  (declare (indent 2) (debug (symbolp form body)))
+  `(firefox-to-emacs-native-messenger-test--with-saved-whitelists
+    (setq firefox-to-emacs-native-messenger-run-whitelist ,run-whitelist)
+    (firefox-to-emacs-native-messenger-test--with-stub-connection ,client-var
+      (cl-letf (((symbol-function
+                  'firefox-to-emacs-native-messenger--write-response)
+                 (lambda (_c _r) nil)))
+        ,@body))))
+
+(defun firefox-to-emacs-native-messenger-test--cleanup-run-state-and-subprocess
+    (client)
+  "Tear down a run-state and its subprocess linked from CLIENT.
+Used in `unwind-protect' cleanups to ensure tests do not leak."
+  (let ((sub (process-get
+              client
+              firefox-to-emacs-native-messenger--connection-key-run-subprocess)))
+    (when (processp sub)
+      (let ((state (process-get
+                    sub
+                    firefox-to-emacs-native-messenger--subprocess-key-run-state)))
+        (when (hash-table-p state)
+          (firefox-to-emacs-native-messenger--cancel-timer
+           (gethash 'timeout-timer state))))
+      (when (process-live-p sub)
+        (ignore-errors (signal-process (process-id sub) 'kill))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-handler-missing-command-field ()
+  "Request without `command' field returns the generic missing-field error."
+  :tags '(:unit)
+  (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+   (setq firefox-to-emacs-native-messenger-run-whitelist '("*"))
+   (let ((resp (firefox-to-emacs-native-messenger--run-handler
+                nil '((cmd . "run")))))
+     (should (equal "error" (alist-get 'cmd resp)))
+     (should (equal "missing required field: command"
+                    (alist-get 'error resp))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-handler-non-string-command ()
+  "Request with `command' that is null or non-string returns the generic error."
+  :tags '(:unit)
+  (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+   (setq firefox-to-emacs-native-messenger-run-whitelist '("*"))
+   (let ((resp1 (firefox-to-emacs-native-messenger--run-handler
+                 nil '((cmd . "run") (command))))
+         (resp2 (firefox-to-emacs-native-messenger--run-handler
+                 nil '((cmd . "run") (command . 42)))))
+     (should (equal "error" (alist-get 'cmd resp1)))
+     (should (equal "missing required field: command"
+                    (alist-get 'error resp1)))
+     (should (equal "error" (alist-get 'cmd resp2)))
+     (should (equal "missing required field: command"
+                    (alist-get 'error resp2))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-handler-launches-subprocess ()
+  "Handler launches a subprocess via /bin/sh -c COMMAND-STRING.
+
+Asserts the subprocess exists, the run-state hash table is
+populated, and the connection state transitions to `dispatched'."
+  :tags '(:integration :run-subprocess)
+  (firefox-to-emacs-native-messenger-test--with-run-handler-fixture
+      client '("*")
+    (unwind-protect
+        (progn
+          (firefox-to-emacs-native-messenger--run-handler
+           client `((cmd . "run") (command . "true") (content . "")))
+          (let ((sub (process-get
+                      client
+                      firefox-to-emacs-native-messenger--connection-key-run-subprocess)))
+            (should (processp sub))
+            (let ((state (process-get
+                          sub
+                          firefox-to-emacs-native-messenger--subprocess-key-run-state)))
+              (should (hash-table-p state))
+              (should (eq client (gethash 'connection state)))
+              (should (eq sub (gethash 'subprocess state)))
+              (should (equal "true" (gethash 'command-string state))))
+            (should (eq 'dispatched
+                        (process-get
+                         client
+                         firefox-to-emacs-native-messenger--connection-key-state)))))
+      (firefox-to-emacs-native-messenger-test--cleanup-run-state-and-subprocess
+       client))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-handler-cross-link ()
+  "Handler creates bidirectional cross-link between connection and subprocess."
+  :tags '(:integration :run-subprocess)
+  (firefox-to-emacs-native-messenger-test--with-run-handler-fixture
+      client '("*")
+    (unwind-protect
+        (progn
+          (firefox-to-emacs-native-messenger--run-handler
+           client `((cmd . "run") (command . "true") (content . "")))
+          (let* ((sub (process-get
+                       client
+                       firefox-to-emacs-native-messenger--connection-key-run-subprocess))
+                 (state (process-get
+                         sub
+                         firefox-to-emacs-native-messenger--subprocess-key-run-state)))
+            (should (eq sub (gethash 'subprocess state)))
+            (should (eq client (gethash 'connection state)))))
+      (firefox-to-emacs-native-messenger-test--cleanup-run-state-and-subprocess
+       client))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-handler-pgrp-captured ()
+  "Handler captures pgrp via `process-attributes', falling back to PID.
+
+Emacs creates each subprocess as its own session and process-group
+leader; its PID equals its PGID.  If `process-attributes' returns
+an alist with `pgrp', the handler uses that; otherwise (or if the
+subprocess exited too quickly to enumerate), the handler falls
+back to `process-id'."
+  :tags '(:integration :run-subprocess)
+  (firefox-to-emacs-native-messenger-test--with-run-handler-fixture
+      client '("*")
+    (unwind-protect
+        (progn
+          (firefox-to-emacs-native-messenger--run-handler
+           client `((cmd . "run") (command . "sleep 2") (content . "")))
+          (let* ((sub (process-get
+                       client
+                       firefox-to-emacs-native-messenger--connection-key-run-subprocess))
+                 (state (process-get
+                         sub
+                         firefox-to-emacs-native-messenger--subprocess-key-run-state))
+                 (pgrp (gethash 'pgrp state))
+                 (pid (process-id sub)))
+            (should (integerp pgrp))
+            ;; Emacs creates each subprocess as its own session leader, so pgrp == pid.
+            (should (or (= pgrp pid)
+                        (= pgrp (or (alist-get 'pgrp
+                                               (ignore-errors
+                                                 (process-attributes pid)))
+                                    pid))))))
+      (firefox-to-emacs-native-messenger-test--cleanup-run-state-and-subprocess
+       client))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-handler-state-fields-populated ()
+  "After launch, the run-state hash table has every documented field initialized."
+  :tags '(:integration :run-subprocess)
+  (firefox-to-emacs-native-messenger-test--with-run-handler-fixture
+      client '("*")
+    (unwind-protect
+        (progn
+          (firefox-to-emacs-native-messenger--run-handler
+           client `((cmd . "run") (command . "echo hello") (content . "in")))
+          (let* ((sub (process-get
+                       client
+                       firefox-to-emacs-native-messenger--connection-key-run-subprocess))
+                 (state (process-get
+                         sub
+                         firefox-to-emacs-native-messenger--subprocess-key-run-state)))
+            (should (hash-table-p state))
+            (should-not (gethash 'terminal-cause state))
+            (should (stringp (gethash 'output-buffer state)))
+            (should (integerp (gethash 'output-bytes state)))
+            (should (integerp (gethash 'output-cap state)))
+            (should (eq sub (gethash 'subprocess state)))
+            (should (eq client (gethash 'connection state)))
+            (should (equal "echo hello" (gethash 'command-string state)))
+            (should (integerp (gethash 'pgrp state)))
+            (should (memq (gethash 'pgrp-fallback state) '(t nil)))))
+      (firefox-to-emacs-native-messenger-test--cleanup-run-state-and-subprocess
+       client))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-handler-stdin-content-sent ()
+  "The request's `content' is sent to subprocess stdin, then EOF closes it.
+
+A `cat' subprocess echoes stdin to stdout; the accumulator filter
+captures the result in the run-state's output-buffer."
+  :tags '(:integration :run-subprocess :slow)
+  (firefox-to-emacs-native-messenger-test--with-run-handler-fixture
+      client '("*")
+    (unwind-protect
+        (progn
+          (firefox-to-emacs-native-messenger--run-handler
+           client `((cmd . "run") (command . "cat") (content . "input data")))
+          (let* ((sub (process-get
+                       client
+                       firefox-to-emacs-native-messenger--connection-key-run-subprocess))
+                 (state (process-get
+                         sub
+                         firefox-to-emacs-native-messenger--subprocess-key-run-state)))
+            ;; Wait for cat to read stdin, echo it, and exit on EOF.
+            (let ((deadline (+ (float-time) 2.0)))
+              (while (and (process-live-p sub) (< (float-time) deadline))
+                (accept-process-output sub 0.05)))
+            (should-not (process-live-p sub))
+            (should (equal "input data" (gethash 'output-buffer state)))))
+      (firefox-to-emacs-native-messenger-test--cleanup-run-state-and-subprocess
+       client))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-handler-empty-content-ok ()
+  "Empty content (or absent content) does not break the launch.
+
+The handler defaults content to the empty string when the field is
+absent or null; an empty string write is a zero-byte no-op
+followed by EOF."
+  :tags '(:integration :run-subprocess :slow)
+  (firefox-to-emacs-native-messenger-test--with-run-handler-fixture
+      client '("*")
+    (unwind-protect
+        (progn
+          (firefox-to-emacs-native-messenger--run-handler
+           client `((cmd . "run") (command . "echo done")))
+          (let* ((sub (process-get
+                       client
+                       firefox-to-emacs-native-messenger--connection-key-run-subprocess)))
+            (let ((deadline (+ (float-time) 2.0)))
+              (while (and (process-live-p sub) (< (float-time) deadline))
+                (accept-process-output sub 0.05)))
+            (should-not (process-live-p sub))))
+      (firefox-to-emacs-native-messenger-test--cleanup-run-state-and-subprocess
+       client))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-handler-epipe-tolerated ()
+  "Subprocess that closes stdin before we write does NOT propagate EPIPE.
+
+The handler catches the send error and logs at info level; state
+is still set up correctly and the subprocess sentinel will fire
+the response from the subsequent exit."
+  :tags '(:integration :run-subprocess :slow)
+  (firefox-to-emacs-native-messenger-test--with-run-handler-fixture
+      client '("*")
+    (unwind-protect
+        (progn
+          ;; Subprocess closes stdin then exits immediately.
+          (firefox-to-emacs-native-messenger--run-handler
+           client `((cmd . "run")
+                    (command . "exec 0<&-; true")
+                    (content . "this-data-might-EPIPE")))
+          (let* ((sub (process-get
+                       client
+                       firefox-to-emacs-native-messenger--connection-key-run-subprocess)))
+            (should (processp sub))
+            ;; Wait for exit
+            (let ((deadline (+ (float-time) 2.0)))
+              (while (and (process-live-p sub) (< (float-time) deadline))
+                (accept-process-output sub 0.05)))
+            (should-not (process-live-p sub))))
+      (firefox-to-emacs-native-messenger-test--cleanup-run-state-and-subprocess
+       client))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-handler-default-directory-home ()
+  "Subprocess inherits cwd from `default-directory' bound to ~/.
+
+Running `pwd' should print the user's home directory (resolved
+absolute path)."
+  :tags '(:integration :run-subprocess :slow)
+  (firefox-to-emacs-native-messenger-test--with-run-handler-fixture
+      client '("*")
+    (unwind-protect
+        (progn
+          (firefox-to-emacs-native-messenger--run-handler
+           client `((cmd . "run") (command . "pwd") (content . "")))
+          (let* ((sub (process-get
+                       client
+                       firefox-to-emacs-native-messenger--connection-key-run-subprocess))
+                 (state (process-get
+                         sub
+                         firefox-to-emacs-native-messenger--subprocess-key-run-state)))
+            (let ((deadline (+ (float-time) 2.0)))
+              (while (and (process-live-p sub) (< (float-time) deadline))
+                (accept-process-output sub 0.05)))
+            (let* ((home (expand-file-name "~/"))
+                   (captured (gethash 'output-buffer state))
+                   ;; Trim trailing newline from pwd output for comparison
+                   (trimmed (string-trim captured))
+                   (home-trimmed (directory-file-name home)))
+              ;; pwd typically prints the resolved path; allow either ~ or its
+              ;; canonical form.
+              (should (or (equal trimmed home-trimmed)
+                          (equal trimmed home)
+                          (equal (file-name-as-directory trimmed) home))))))
+      (firefox-to-emacs-native-messenger-test--cleanup-run-state-and-subprocess
+       client))))
+
+;;;; TASK-18300: end-to-end run scenarios via the wire.
+;;;; These tests exercise the full pipeline: listener -> filter ->
+;;;; dispatcher -> run handler -> subprocess -> accumulator filter ->
+;;;; subprocess sentinel -> response writer -> framed response on
+;;;; the wire.  They use `send-frame' against a sandbox listener.
+
+(defmacro firefox-to-emacs-native-messenger-test--with-run-wire-listener
+    (sock-var &rest body)
+  "Start a listener in a sandbox with run-whitelist `(\"*\")' for BODY.
+
+SOCK-VAR is bound to the bound socket path.  Both the run-whitelist
+and read-whitelist defcustoms are saved/restored; for tests that
+need different values BODY can re-set them inside its body."
+  (declare (indent 1) (debug (symbolp body)))
+  (let ((cache-sym (gensym "fenm-wire-cache-"))
+        (tmp-sym (gensym "fenm-wire-tmp-")))
+    `(firefox-to-emacs-native-messenger-test--with-listener-sandbox
+         ,cache-sym ,tmp-sym ,sock-var
+       (firefox-to-emacs-native-messenger-test--with-fresh-connection-registry
+        (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+         (setq firefox-to-emacs-native-messenger-run-whitelist '("*"))
+         (setq firefox-to-emacs-native-messenger-read-whitelist '("*"))
+         (firefox-to-emacs-native-messenger-start)
+         ,@body)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-wire-zero-exit-stdout ()
+  "Full wire round-trip: `run' with `echo hello' returns content+code 0."
+  :tags '(:integration :run-subprocess :slow)
+  (firefox-to-emacs-native-messenger-test--with-run-wire-listener sock
+    (let ((resp (firefox-to-emacs-native-messenger-test-send-frame
+                 sock '((cmd . "run") (command . "echo hello") (content . ""))
+                 10.0)))
+      (should resp)
+      (should (equal "run" (alist-get 'cmd resp)))
+      (should (equal "echo hello" (alist-get 'command resp)))
+      (should (equal "hello\n" (alist-get 'content resp)))
+      (should (= 0 (alist-get 'code resp))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-wire-nonzero-exit ()
+  "Full wire round-trip: nonzero exit status surfaces in `code'."
+  :tags '(:integration :run-subprocess :slow)
+  (firefox-to-emacs-native-messenger-test--with-run-wire-listener sock
+    (let ((resp (firefox-to-emacs-native-messenger-test-send-frame
+                 sock '((cmd . "run")
+                        (command . "echo err >&2; exit 7")
+                        (content . ""))
+                 10.0)))
+      (should resp)
+      (should (equal "run" (alist-get 'cmd resp)))
+      (should (= 7 (alist-get 'code resp)))
+      (should (string-match-p "err" (alist-get 'content resp))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-wire-stdin-piped ()
+  "Full wire round-trip: request `content' is piped to subprocess stdin."
+  :tags '(:integration :run-subprocess :slow)
+  (firefox-to-emacs-native-messenger-test--with-run-wire-listener sock
+    (let ((resp (firefox-to-emacs-native-messenger-test-send-frame
+                 sock '((cmd . "run")
+                        (command . "cat")
+                        (content . "pipeable bytes"))
+                 10.0)))
+      (should resp)
+      (should (equal "run" (alist-get 'cmd resp)))
+      (should (equal "pipeable bytes" (alist-get 'content resp)))
+      (should (= 0 (alist-get 'code resp))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-wire-overflow ()
+  "Full wire round-trip: exceeding run-output-cap returns the overflow error."
+  :tags '(:integration :run-subprocess :slow)
+  (firefox-to-emacs-native-messenger-test--with-run-wire-listener sock
+    (let ((firefox-to-emacs-native-messenger-run-output-cap 32)
+          (firefox-to-emacs-native-messenger-run-sigint-grace 0.3)
+          (firefox-to-emacs-native-messenger-run-sigterm-grace 0.3))
+      (let ((resp (firefox-to-emacs-native-messenger-test-send-frame
+                   sock '((cmd . "run")
+                          (command . "yes overflow-bytes")
+                          (content . ""))
+                   10.0)))
+        (should resp)
+        (should (equal "error" (alist-get 'cmd resp)))
+        (should (equal "response too large" (alist-get 'error resp)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-wire-timeout ()
+  "Full wire round-trip: the run-timeout defcustom triggers the timeout error."
+  :tags '(:integration :run-subprocess :slow)
+  (firefox-to-emacs-native-messenger-test--with-run-wire-listener sock
+    (let ((firefox-to-emacs-native-messenger-run-timeout 0.3)
+          (firefox-to-emacs-native-messenger-run-sigint-grace 0.3)
+          (firefox-to-emacs-native-messenger-run-sigterm-grace 0.3))
+      (let ((resp (firefox-to-emacs-native-messenger-test-send-frame
+                   sock '((cmd . "run")
+                          (command . "sleep 30")
+                          (content . ""))
+                   10.0)))
+        (should resp)
+        (should (equal "error" (alist-get 'cmd resp)))
+        (should (equal "run timeout exceeded" (alist-get 'error resp)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-wire-peer-close-cancellation ()
+  "Peer close while subprocess running cancels via connection-loss; no response.
+
+The test opens a client, sends a long-running command, closes the
+client without reading the response, and verifies the subprocess
+has been terminated within the escalation grace + small buffer."
+  :tags '(:integration :run-subprocess :slow)
+  (firefox-to-emacs-native-messenger-test--with-run-wire-listener sock
+    (let ((firefox-to-emacs-native-messenger-run-sigint-grace 0.3)
+          (firefox-to-emacs-native-messenger-run-sigterm-grace 0.3))
+      (let* ((request '((cmd . "run") (command . "sleep 30") (content . "")))
+             (request-bytes (encode-coding-string
+                             (json-serialize request) 'utf-8 t))
+             (frame (concat
+                     (firefox-to-emacs-native-messenger-test--pack-length
+                      (length request-bytes))
+                     request-bytes))
+             (client (make-network-process
+                      :name "fenm-test-peer-close-client"
+                      :family 'local :service sock
+                      :coding '(binary . binary)
+                      :noquery t)))
+        (unwind-protect
+            (progn
+              (process-send-string client frame)
+              (accept-process-output nil 0.3)
+              (let* ((server-side
+                      (car (firefox-to-emacs-native-messenger--connection-registry-list)))
+                     (sub (and server-side
+                               (process-get
+                                server-side
+                                firefox-to-emacs-native-messenger--connection-key-run-subprocess))))
+                (should server-side)
+                (should (processp sub))
+                (should (process-live-p sub))
+                (delete-process client)
+                (let ((deadline (+ (float-time) 2.0)))
+                  (while (and (process-live-p sub) (< (float-time) deadline))
+                    (accept-process-output sub 0.05)))
+                (should-not (process-live-p sub))))
+          (when (process-live-p client)
+            (delete-process client)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-wire-raw-vs-serialized-cap-gap ()
+  "Output that fits the run-output-cap can still exceed the outbound cap once JSON-escaped.
+
+A subprocess emitting N newline bytes (each escaped to two-byte
+`\\n' in JSON) doubles in size on serialization.  With a
+run-output-cap above N and an outbound-response-cap below 2*N, the
+response writer's post-serialize replacement surfaces the
+`response too large' error."
+  :tags '(:integration :run-subprocess :slow)
+  (firefox-to-emacs-native-messenger-test--with-run-wire-listener sock
+    (let ((firefox-to-emacs-native-messenger-run-output-cap 8192)
+          (firefox-to-emacs-native-messenger-outbound-response-cap 4096)
+          (firefox-to-emacs-native-messenger-run-sigint-grace 0.3)
+          (firefox-to-emacs-native-messenger-run-sigterm-grace 0.3))
+      (let ((resp (firefox-to-emacs-native-messenger-test-send-frame
+                   sock '((cmd . "run")
+                          (command . "yes '' | head -c 4000")
+                          (content . ""))
+                   10.0)))
+        (should resp)
+        (should (equal "error" (alist-get 'cmd resp)))
+        (should (equal "response too large" (alist-get 'error resp)))))))
+
+;;;; TASK-18400: process-group cancellation reaches grandchildren.
+
+(defun firefox-to-emacs-native-messenger-test--count-procs-in-pgrp (pgrp)
+  "Return the count of processes whose `pgrp' matches PGRP.
+
+Enumerates the system process table via `list-system-processes' and
+filters by attributes.  Used to verify that signal-escalation has
+terminated every descendant in the run subprocess's session."
+  (length
+   (cl-remove-if-not
+    (lambda (pid)
+      (let ((attrs (ignore-errors (process-attributes pid))))
+        (and attrs (eq pgrp (alist-get 'pgrp attrs)))))
+    (list-system-processes))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-wire-pgrp-reaches-grandchildren ()
+  "Process-group cancellation reaps backgrounded grandchildren.
+
+The command `sleep 100 & wait' forks a shell that backgrounds a
+sleep then waits.  Both processes live in the same session via
+the same shell session (Emacs creates each subprocess as its own session leader); SIGKILL on (- pgrp) must reach both.  After cancellation
+no process in the original pgrp must survive."
+  :tags '(:integration :run-subprocess :slow)
+  (firefox-to-emacs-native-messenger-test--with-run-wire-listener sock
+    (let ((firefox-to-emacs-native-messenger-run-timeout 0.3)
+          (firefox-to-emacs-native-messenger-run-sigint-grace 0.2)
+          (firefox-to-emacs-native-messenger-run-sigterm-grace 0.2))
+      (let* ((request '((cmd . "run")
+                        (command . "sleep 100 & wait")
+                        (content . "")))
+             (request-bytes (encode-coding-string
+                             (json-serialize request) 'utf-8 t))
+             (frame (concat
+                     (firefox-to-emacs-native-messenger-test--pack-length
+                      (length request-bytes))
+                     request-bytes))
+             (client (make-network-process
+                      :name "fenm-test-grandchild-client"
+                      :family 'local :service sock
+                      :coding '(binary . binary)
+                      :noquery t))
+             (recv-buf ""))
+        (set-process-filter
+         client
+         (lambda (_p data) (setq recv-buf (concat recv-buf data))))
+        (unwind-protect
+            (progn
+              (process-send-string client frame)
+              (accept-process-output nil 0.3)
+              (let* ((server-side
+                      (car (firefox-to-emacs-native-messenger--connection-registry-list)))
+                     (sub (and server-side
+                               (process-get
+                                server-side
+                                firefox-to-emacs-native-messenger--connection-key-run-subprocess)))
+                     (state (and sub (process-get
+                                      sub
+                                      firefox-to-emacs-native-messenger--subprocess-key-run-state)))
+                     (pgrp (and state (gethash 'pgrp state))))
+                (should (integerp pgrp))
+                (let ((deadline (+ (float-time) 4.0)))
+                  (while (and (process-live-p sub) (< (float-time) deadline))
+                    (accept-process-output sub 0.05)))
+                (sleep-for 0.2)
+                (should-not (process-live-p sub))
+                (should
+                 (= 0
+                    (firefox-to-emacs-native-messenger-test--count-procs-in-pgrp
+                     pgrp)))))
+          (when (process-live-p client)
+            (delete-process client)))))))
+
+;;;; TASK-18600: `run' command-gate composition tests.
+;;;; Verifies the gate fires BEFORE subprocess setup per REQ-3300 and
+;;;; integrates with the capability registry: only commands matching a
+;;;; whitelist entry (literal or template with `<TEMP-PATH>') are run.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-gate-composition-empty-rejects ()
+  "Default deny: empty whitelist rejects all run requests at the wire."
+  :tags '(:integration :run-subprocess)
+  (firefox-to-emacs-native-messenger-test--with-listener-sandbox
+      _cache _tmp sock
+    (firefox-to-emacs-native-messenger-test--with-fresh-connection-registry
+     (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+      (setq firefox-to-emacs-native-messenger-run-whitelist nil)
+      (firefox-to-emacs-native-messenger-start)
+      (let ((resp (firefox-to-emacs-native-messenger-test-send-frame
+                   sock '((cmd . "run") (command . "echo hello") (content . ""))
+                   5.0)))
+        (should resp)
+        (should (equal "error" (alist-get 'cmd resp)))
+        (should (equal "command not in whitelist"
+                       (alist-get 'error resp))))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-gate-composition-emacsclient-temp-path ()
+  "Whitelist `(\"true <TEMP-PATH>\")' allows running with a registered path.
+
+`true' is used in place of `emacsclient' because the test
+environment may not have `emacsclient' on PATH; the gate logic is
+identical."
+  :tags '(:integration :run-subprocess :slow)
+  (firefox-to-emacs-native-messenger-test--with-listener-sandbox
+      _cache _tmp sock
+    (firefox-to-emacs-native-messenger-test--with-fresh-connection-registry
+     (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+      (setq firefox-to-emacs-native-messenger-run-whitelist '("true <TEMP-PATH>"))
+      (setq firefox-to-emacs-native-messenger-read-whitelist '("*"))
+      (firefox-to-emacs-native-messenger-start)
+      (let* ((temp-resp
+              (firefox-to-emacs-native-messenger-test-send-frame
+               sock '((cmd . "temp") (content . "x") (prefix . "host"))
+               5.0))
+             (path (alist-get 'content temp-resp))
+             (run-resp
+              (firefox-to-emacs-native-messenger-test-send-frame
+               sock `((cmd . "run")
+                      (command . ,(concat "true " path))
+                      (content . ""))
+               5.0)))
+        (should (equal "temp" (alist-get 'cmd temp-resp)))
+        (should (equal "run" (alist-get 'cmd run-resp)))
+        (should (= 0 (alist-get 'code run-resp))))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-gate-composition-rejects-non-registered-path ()
+  "Whitelist `(\"true <TEMP-PATH>\")' rejects commands with non-registered paths."
+  :tags '(:integration :run-subprocess)
+  (firefox-to-emacs-native-messenger-test--with-listener-sandbox
+      _cache _tmp sock
+    (firefox-to-emacs-native-messenger-test--with-fresh-connection-registry
+     (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+      (setq firefox-to-emacs-native-messenger-run-whitelist '("true <TEMP-PATH>"))
+      (firefox-to-emacs-native-messenger-start)
+      (let ((resp (firefox-to-emacs-native-messenger-test-send-frame
+                   sock '((cmd . "run")
+                          (command . "true /not/a/registered/path")
+                          (content . ""))
+                   5.0)))
+        (should (equal "error" (alist-get 'cmd resp)))
+        (should (equal "command not in whitelist"
+                       (alist-get 'error resp))))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-gate-composition-rm-removes-file ()
+  "Whitelist `(\"rm -f '<TEMP-PATH>'\")' allows rm on a registered path and the file is gone."
+  :tags '(:integration :run-subprocess :slow)
+  (firefox-to-emacs-native-messenger-test--with-listener-sandbox
+      _cache _tmp sock
+    (firefox-to-emacs-native-messenger-test--with-fresh-connection-registry
+     (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+      (setq firefox-to-emacs-native-messenger-run-whitelist
+            '("rm -f '<TEMP-PATH>'"))
+      (firefox-to-emacs-native-messenger-start)
+      (let* ((temp-resp
+              (firefox-to-emacs-native-messenger-test-send-frame
+               sock '((cmd . "temp") (content . "y") (prefix . "host"))
+               5.0))
+             (path (alist-get 'content temp-resp))
+             (cmd-str (format "rm -f '%s'" path))
+             (run-resp
+              (firefox-to-emacs-native-messenger-test-send-frame
+               sock `((cmd . "run") (command . ,cmd-str) (content . ""))
+               5.0)))
+        (should (equal "run" (alist-get 'cmd run-resp)))
+        (should (= 0 (alist-get 'code run-resp)))
+        (sleep-for 0.1)
+        (should-not (file-exists-p path)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-gate-composition-no-subprocess-on-reject ()
+  "Gate rejection happens BEFORE subprocess setup; no run-subprocess link is established.
+
+After a rejected request the connection's `run-subprocess' plist
+key remains unset and no run-state hash table is attached anywhere
+that the test can discover via the registry-side accepted client."
+  :tags '(:integration :run-subprocess)
+  (firefox-to-emacs-native-messenger-test--with-listener-sandbox
+      _cache _tmp sock
+    (firefox-to-emacs-native-messenger-test--with-fresh-connection-registry
+     (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+      (setq firefox-to-emacs-native-messenger-run-whitelist nil)
+      (firefox-to-emacs-native-messenger-start)
+      (let* ((make-process-calls 0)
+             (orig-make-process (symbol-function 'make-process)))
+        (cl-letf (((symbol-function 'make-process)
+                   (lambda (&rest args)
+                     (cl-incf make-process-calls)
+                     (apply orig-make-process args))))
+          (let ((resp (firefox-to-emacs-native-messenger-test-send-frame
+                       sock '((cmd . "run")
+                              (command . "should-not-run")
+                              (content . ""))
+                       5.0)))
+            (should resp)
+            (should (equal "error" (alist-get 'cmd resp)))
+            (should (= 0 make-process-calls)))))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-gate-composition-prune-after-file-removed ()
+  "Registry prune-on-access invalidates a previously-allowed `<TEMP-PATH>'.
+
+After the file is deleted out-of-band, the same command-string
+fails the gate because `--registry-contains-p' prunes the missing
+entry, so the template's marker substring no longer matches."
+  :tags '(:integration :run-subprocess :slow)
+  (firefox-to-emacs-native-messenger-test--with-listener-sandbox
+      _cache _tmp sock
+    (firefox-to-emacs-native-messenger-test--with-fresh-connection-registry
+     (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+      (setq firefox-to-emacs-native-messenger-run-whitelist
+            '("cat <TEMP-PATH>"))
+      (firefox-to-emacs-native-messenger-start)
+      (let* ((temp-resp
+              (firefox-to-emacs-native-messenger-test-send-frame
+               sock '((cmd . "temp") (content . "marker") (prefix . "h"))
+               5.0))
+             (path (alist-get 'content temp-resp))
+             (cmd-str (concat "cat " path))
+             (run-resp1
+              (firefox-to-emacs-native-messenger-test-send-frame
+               sock `((cmd . "run") (command . ,cmd-str) (content . ""))
+               5.0)))
+        (should (file-exists-p path))
+        (should (equal "run" (alist-get 'cmd run-resp1)))
+        (should (equal "marker" (alist-get 'content run-resp1)))
+        (delete-file path)
+        (should-not (file-exists-p path))
+        (let ((run-resp2
+               (firefox-to-emacs-native-messenger-test-send-frame
+                sock `((cmd . "run") (command . ,cmd-str) (content . ""))
+                5.0)))
+          (should (equal "error" (alist-get 'cmd run-resp2)))
+          (should (equal "command not in whitelist"
+                         (alist-get 'error run-resp2)))))))))
+
+;;;; TASK-19000: fast-exit pgrp capture and stdin-EPIPE wire-level tests.
+;;;; Verifies the `process-attributes' fallback to `process-id' for
+;;;; subprocesses that exit before attributes can be enumerated, and
+;;;; that EPIPE on the stdin-send step does NOT propagate (the
+;;;; sentinel still delivers the response from the exit observation).
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-wire-fast-exit-pgrp-fallback ()
+  "A subprocess running `true' may exit before `process-attributes' enumerates pgrp.
+
+The handler must use the PID fallback in that case; the response
+is delivered with code 0 and empty content."
+  :tags '(:integration :run-subprocess :slow)
+  (firefox-to-emacs-native-messenger-test--with-run-wire-listener sock
+    (let ((resp (firefox-to-emacs-native-messenger-test-send-frame
+                 sock '((cmd . "run")
+                        (command . "true")
+                        (content . ""))
+                 5.0)))
+      (should resp)
+      (should (equal "run" (alist-get 'cmd resp)))
+      (should (equal "" (alist-get 'content resp)))
+      (should (= 0 (alist-get 'code resp))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-run-wire-stdin-send-after-exit ()
+  "Subprocess that closes stdin and exits before we send must not propagate EPIPE.
+
+The handler catches the stdin-send error and logs at info level;
+the subprocess sentinel still produces the terminal response from
+the exit observation."
+  :tags '(:integration :run-subprocess :slow)
+  (firefox-to-emacs-native-messenger-test--with-run-wire-listener sock
+    (let ((resp (firefox-to-emacs-native-messenger-test-send-frame
+                 sock '((cmd . "run")
+                        (command . "exec 0<&-; true")
+                        (content . "this-data-might-EPIPE"))
+                 5.0)))
+      (should resp)
+      (should (equal "run" (alist-get 'cmd resp)))
+      (should (= 0 (alist-get 'code resp))))))
+
+;;;; TASK-19100: full FIVE-cmd wire round-trip.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-five-cmd-wire-roundtrip ()
+  "Sequence: version -> getconfigpath -> temp -> read -> run.
+
+Each cmd's wire response matches its PROTOCOL.md fixture shape.
+The whitelists are set to specific entries (NOT `(\"*\")') so the
+gate matcher is actually exercised on the registered path."
+  :tags '(:integration :sandbox :run-subprocess :slow)
+  (firefox-to-emacs-native-messenger-test--with-listener-sandbox
+      _cache _tmp sock
+    (firefox-to-emacs-native-messenger-test--with-fresh-connection-registry
+     (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+      (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir
+       rc-sandbox
+       (let* ((rc-path (expand-file-name "tridactylrc" rc-sandbox))
+              (firefox-to-emacs-native-messenger-rcpath-candidates
+               (list rc-path)))
+         (with-temp-file rc-path
+           (insert "set editorcmd emacsclient %f\n"))
+         (setq firefox-to-emacs-native-messenger-run-whitelist
+               '("cat <TEMP-PATH>"))
+         (setq firefox-to-emacs-native-messenger-read-whitelist
+               '("<TEMP-PATH>"))
+         (firefox-to-emacs-native-messenger-start)
+         ;; 1. version
+         (let ((ver (firefox-to-emacs-native-messenger-test-send-frame
+                     sock '((cmd . "version")) 5.0)))
+           (should (equal "version" (alist-get 'cmd ver)))
+           (should (stringp (alist-get 'version ver)))
+           (should (> (length (alist-get 'version ver)) 0))
+           (should (= 0 (alist-get 'code ver))))
+         ;; 2. getconfigpath with a sandboxed candidate that exists
+         (let ((gcp (firefox-to-emacs-native-messenger-test-send-frame
+                     sock '((cmd . "getconfigpath")) 5.0)))
+           (should (equal "getconfigpath" (alist-get 'cmd gcp)))
+           (should (equal rc-path (alist-get 'content gcp)))
+           (should (= 0 (alist-get 'code gcp))))
+         ;; 3. temp
+         (let* ((temp-resp
+                 (firefox-to-emacs-native-messenger-test-send-frame
+                  sock '((cmd . "temp")
+                         (content . "five-cmd-roundtrip")
+                         (prefix . "host"))
+                  5.0))
+                (path (alist-get 'content temp-resp)))
+           (should (equal "temp" (alist-get 'cmd temp-resp)))
+           (should (stringp path))
+           (should (file-exists-p path))
+           ;; 4. read
+           (let ((read-resp
+                  (firefox-to-emacs-native-messenger-test-send-frame
+                   sock `((cmd . "read") (file . ,path)) 5.0)))
+             (should (equal "read" (alist-get 'cmd read-resp)))
+             (should (equal "five-cmd-roundtrip"
+                            (alist-get 'content read-resp)))
+             (should (= 0 (alist-get 'code read-resp))))
+           ;; 5. run
+           (let ((run-resp
+                  (firefox-to-emacs-native-messenger-test-send-frame
+                   sock `((cmd . "run")
+                          (command . ,(concat "cat " path))
+                          (content . ""))
+                   10.0)))
+             (should (equal "run" (alist-get 'cmd run-resp)))
+             (should (equal "five-cmd-roundtrip"
+                            (alist-get 'content run-resp)))
+             (should (= 0 (alist-get 'code run-resp)))))))))))
 
 (provide 'firefox-to-emacs-native-messenger-tests)
 ;;; firefox-to-emacs-native-messenger-tests.el ends here

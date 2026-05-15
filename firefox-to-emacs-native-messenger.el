@@ -114,20 +114,6 @@ forcibly deleted after this many seconds if the peer has not closed."
   "-c"
   "Flag passed to the shell binary to introduce the command string.")
 
-(defconst firefox-to-emacs-native-messenger-setsid-binary
-  "setsid"
-  "Name of the setsid binary used to launch `run' subprocesses in a new session.
-The binary is resolved against the daemon's PATH at launch time.")
-
-(defconst firefox-to-emacs-native-messenger-run-command-prefix
-  (list firefox-to-emacs-native-messenger-setsid-binary
-        "--"
-        firefox-to-emacs-native-messenger-shell-binary
-        firefox-to-emacs-native-messenger-shell-command-switch)
-  "Fixed command-list prefix passed to `make-process' for `run' subprocesses.
-At dispatch time the per-request COMMAND-STRING is appended to this prefix to
-form the full :command list ((setsid -- /bin/sh -c COMMAND-STRING)).")
-
 (defconst firefox-to-emacs-native-messenger-socat-half-close-timeout-seconds
   86400
   "Half-close timeout, in seconds, applied to socat by the wrapper.
@@ -305,6 +291,33 @@ The timer is scheduled by the response writer (PAT-0600 / Section 8.18
 step 6) and cancelled by the per-connection sentinel on peer-close.
 Bounded liveness: timer expiration triggers connection teardown per
 Section 8.22.")
+
+(defconst firefox-to-emacs-native-messenger--subprocess-key-run-state
+  'run-state
+  "Subprocess plist key for the Phase 0800 run-state hash table.
+
+The value at this key is a hash table (test `eq') populated by the
+`run' handler at subprocess launch and consulted by the run
+accumulator filter, the run subprocess sentinel, the run-timeout
+timer, the signal-escalation helper, and the connection sentinel's
+run-cancellation extension.  Per-process plist keys are defined as
+defconsts to keep plist accesses symbolic per Section 8.11 / 8.3.
+
+The hash table's keys are documented in Section 8.3 of the plan:
+`terminal-cause', `output-buffer', `output-bytes', `output-cap',
+`subprocess', `connection', `command-string', `pgrp',
+`pgrp-fallback', `timeout-timer'.")
+
+(defconst firefox-to-emacs-native-messenger--connection-key-run-subprocess
+  'run-subprocess
+  "Per-connection plist key for the back-reference to the run subprocess.
+
+The value at this key is the `process' object of the run subprocess
+linked to this connection, or nil when no run is in flight.  Set by
+the `run' handler when transitioning the connection state to
+`dispatched'; consulted by the connection sentinel's run-cancellation
+extension to find the subprocess that needs signal-escalation on
+peer-close per PAT-0800.")
 
 (define-error 'firefox-to-emacs-native-messenger-error
   "firefox-to-emacs-native-messenger bridge error")
@@ -1489,8 +1502,15 @@ close event:
   - cancels the per-connection read-timeout timer;
   - cancels the post-response cleanup timer (if scheduled);
   - logs the event, distinguishing peer-close-after-response
-    (prior state was responded) from premature peer-close
-    (prior state was reading, dispatched, or already closing);
+    (prior state was responded) from premature peer-close (prior
+    state was reading, dispatched, or already closing);
+  - if prior state was `dispatched' (a Phase 0800 deferred-response
+    run is in flight), triggers the run-cancellation extension:
+    locates the linked subprocess via the connection's
+    `run-subprocess' plist key, CAS-sets the run-state's
+    `terminal-cause' to `connection-loss', cancels any pending
+    timeout-timer, and invokes signal-escalation on the subprocess
+    process group per PAT-0800;
   - sets the connection state to closing;
   - removes the connection from the connection registry.
 
@@ -1512,6 +1532,9 @@ signal) are silently ignored.  Returns nil unconditionally."
           'warn
           "premature peer close on %S in state %s (event: %s)"
           client prior-state trimmed))
+      (when (eq prior-state 'dispatched)
+        (firefox-to-emacs-native-messenger--connection-sentinel--cancel-run
+          client))
       (process-put
         client
         firefox-to-emacs-native-messenger--connection-key-state
@@ -1519,6 +1542,56 @@ signal) are silently ignored.  Returns nil unconditionally."
       (firefox-to-emacs-native-messenger--connection-registry-remove
         client)))
   nil)
+
+(defun firefox-to-emacs-native-messenger--connection-sentinel--cancel-run
+    (client)
+  "Trigger the run-cancellation chain on CLIENT's linked run subprocess.
+
+Called by the per-connection sentinel when prior state was
+`dispatched' (a Phase 0800 deferred-response run was in flight).
+The helper:
+
+  1. Resolves the linked subprocess via the connection's
+     `run-subprocess' plist key.  No-op if unset or not a process.
+  2. Resolves the run-state hash table via the subprocess's
+     `run-state' plist key.  No-op if unset or not a hash table.
+  3. Attempts the CAS transition `terminal-cause' nil ->
+     `\\='connection-loss'.  On successful CAS (the first observer
+     wins), cancels any pending `timeout-timer' and invokes
+     `firefox-to-emacs-native-messenger--run-signal-escalate'.
+     On unsuccessful CAS, the cause is already set by another
+     terminal path (overflow filter, timeout timer, or a
+     concurrent connection sentinel) and the helper is a no-op
+     beyond the log line that the connection-loss observer was
+     not first.
+
+Per PAT-0800 the subprocess sentinel will subsequently fire when
+the subprocess exits and route a `connection-loss' response (which
+is a no-response: the writer's pre-send guard refuses to send when
+the connection state is `closing')."
+  (let ((sub (process-get
+              client
+              firefox-to-emacs-native-messenger--connection-key-run-subprocess)))
+    (when (processp sub)
+      (let ((state (process-get
+                    sub
+                    firefox-to-emacs-native-messenger--subprocess-key-run-state)))
+        (when (hash-table-p state)
+          (cond
+           ((firefox-to-emacs-native-messenger--run-state-cas-terminal-cause
+             state 'connection-loss)
+            (firefox-to-emacs-native-messenger--log
+             'info "connection lost on %S; cancelling run subprocess %S"
+             client sub)
+            (firefox-to-emacs-native-messenger--cancel-timer
+             (gethash 'timeout-timer state))
+            (puthash 'timeout-timer nil state)
+            (firefox-to-emacs-native-messenger--run-signal-escalate state))
+           (t
+            (firefox-to-emacs-native-messenger--log
+             'info
+             "connection lost on %S after terminal-cause already set; no-op"
+             client))))))))
 
 (defun firefox-to-emacs-native-messenger--accept-handler
     (_server client message)
@@ -1960,9 +2033,604 @@ failure produces the upstream `read' open-failure shape (`content =
               (cons 'content "")
               (cons 'code 2))))))
 
-;;;; Register the four synchronous v2 handlers in the dispatcher table.
-;;;; Per REQ-1600, only these four cmds (plus `run' added in Phase 0800)
-;;;; are implemented; every other cmd falls through to "Unhandled message".
+
+;;;; ============================================================
+;;;; Phase 0800: `run' handler, command-gate, and supporting helpers.
+;;;; ============================================================
+
+(defun firefox-to-emacs-native-messenger--run-gate-match-p (command-string)
+  "Return non-nil iff COMMAND-STRING is permitted by the run-whitelist.
+
+Re-validates `firefox-to-emacs-native-messenger-run-whitelist' per
+PAT-1100 site 3 (the per-gate-check site) before consulting entries.
+On malformed defcustom values the shared validator signals
+`firefox-to-emacs-native-messenger-whitelist-malformed'; the `run'
+handler catches the signal and produces the generic error response.
+
+Whitelist semantics per REQ-2800, REQ-3700, REQ-3800:
+
+  - nil or the empty list: deny-all (return nil).
+  - `(\"*\")': allow-all sentinel (return t); the registry is not
+    consulted in this branch.
+  - otherwise: each entry is a template string with zero or more
+    `<TEMP-PATH>' markers; match per
+    `firefox-to-emacs-native-messenger--command-gate-match-p',
+    which anchors L_0 as a prefix, L_N as a suffix, uses
+    first-occurrence search for interior literal segments, and
+    consults `--registry-contains-p' on every extracted marker
+    substring (Section 8.10).
+
+The whitelist is read fresh on every call per REQ-4200; no caching
+is performed so live edits via `customize-set-variable' or `setq'
+take immediate effect on the next gate check."
+  (let ((whitelist firefox-to-emacs-native-messenger-run-whitelist))
+    (firefox-to-emacs-native-messenger--validate-whitelist whitelist 'run)
+    (cond
+     ((null whitelist) nil)
+     ((equal whitelist '("*")) t)
+     (t
+      (cl-block found
+        (dolist (entry whitelist)
+          (when (firefox-to-emacs-native-messenger--command-gate-match-p
+                 entry command-string)
+            (cl-return-from found t)))
+        nil)))))
+
+(defun firefox-to-emacs-native-messenger--run-state-cas-terminal-cause
+    (state new-cause)
+  "Attempt to set STATE's `terminal-cause' to NEW-CAUSE if currently unset.
+
+Returns t on successful transition (the field was nil before this
+call and is now NEW-CAUSE); returns nil without mutating STATE if
+`terminal-cause' is already set.
+
+This is the single-threaded ELisp equivalent of an atomic
+compare-and-set: the first caller wins; subsequent callers return
+nil without modifying STATE.  Per PAT-0700 every terminal path
+(subprocess sentinel observing exit, accumulator filter detecting
+overflow, run-timeout-timer firing, connection sentinel observing
+peer close) calls this helper so that the response shape is
+determined by the FIRST terminal cause that fires, not the latest.
+
+STATE is the run-state hash table created by the `run' handler;
+NEW-CAUSE is one of the five symbols `normal-zero',
+`normal-nonzero', `overflow', `timeout', `connection-loss'."
+  (cond
+   ((gethash 'terminal-cause state) nil)
+   (t
+    (puthash 'terminal-cause new-cause state)
+    t)))
+
+(defun firefox-to-emacs-native-messenger--cancel-timer (timer)
+  "Cancel TIMER if it is a live `timerp' object; no-op otherwise.
+
+Idempotent and nil-tolerant.  `timerp' returns non-nil for any timer
+object including ones that have already been cancelled or fired;
+`cancel-timer' on such objects is a no-op per Emacs convention so
+repeated calls are safe.  Callers pass possibly-nil values from
+plist/hash-table slots (e.g., the run-state's `timeout-timer' field
+when the run-timeout defcustom is unset) without conditional guards
+at every callsite.
+
+Returns nil unconditionally."
+  (when (timerp timer)
+    (cancel-timer timer))
+  nil)
+
+(defcustom firefox-to-emacs-native-messenger-run-sigint-grace 2.0
+  "Seconds between SIGINT and SIGTERM in the run-subprocess signal escalation.
+
+PAT-0800's cancellation policy escalates SIGINT -> SIGTERM ->
+SIGKILL to the run subprocess's process group.  This defcustom
+controls the grace period the bridge waits after SIGINT before
+sending SIGTERM.  The grace period gives well-behaved subprocesses
+time to perform cleanup-on-interrupt (e.g., flushing buffers,
+removing tempfiles) before the more aggressive SIGTERM arrives.
+
+Defaults to 2 seconds.  Tests typically let-bind this to a much
+smaller value (e.g., 0.3) to keep the test suite fast."
+  :type 'number
+  :group 'firefox-to-emacs-native-messenger)
+
+(defcustom firefox-to-emacs-native-messenger-run-sigterm-grace 2.0
+  "Seconds between SIGTERM and SIGKILL in the run-subprocess signal escalation.
+
+PAT-0800's cancellation policy escalates SIGINT -> SIGTERM ->
+SIGKILL to the run subprocess's process group.  This defcustom
+controls the grace period the bridge waits after SIGTERM before
+sending the un-trappable SIGKILL.  Most processes that ignore
+SIGINT respect SIGTERM, so SIGKILL is reached only by processes
+that have explicitly trapped or ignored both prior signals.
+
+Defaults to 2 seconds.  Tests typically let-bind this to a much
+smaller value (e.g., 0.3) to keep the test suite fast."
+  :type 'number
+  :group 'firefox-to-emacs-native-messenger)
+
+(defun firefox-to-emacs-native-messenger--pgrp-has-procs-p (pgrp)
+  "Return non-nil iff process group PGRP currently contains at least one process.
+
+Uses the POSIX null-signal trick: `signal-process (- pgrp) 0' sends
+no actual signal but returns t iff the kernel finds at least one
+process in the group.  Wrapped in `ignore-errors' so a kernel
+error (EPERM, ESRCH) degrades to nil rather than propagating.
+
+This predicate is used by the signal-escalation chain to decide
+whether to send the next signal level.  It is stricter than
+`process-live-p' on the immediate child Emacs subprocess because
+job-control orphans (e.g., a backgrounded sleep whose parent shell
+has already exited) remain in the same pgrp but are no longer
+visible as Emacs processes."
+  (and (integerp pgrp)
+       (ignore-errors (signal-process (- pgrp) 0))))
+
+(defun firefox-to-emacs-native-messenger--run-signal-escalate (state)
+  "Escalate signals to the run-state STATE's subprocess process group.
+
+Implements PAT-0800's SIGINT -> SIGTERM -> SIGKILL escalation:
+
+  1. Send SIGINT to the negative pgrp immediately.
+  2. After `firefox-to-emacs-native-messenger-run-sigint-grace'
+     seconds, if any process in the pgrp is still alive, send
+     SIGTERM.
+  3. After an additional
+     `firefox-to-emacs-native-messenger-run-sigterm-grace' seconds,
+     if any process in the pgrp is still alive, send SIGKILL.
+
+Signaling the NEGATIVE pgrp targets the entire process group per
+`kill(2)' POSIX semantics.  Emacs creates each subprocess as its
+own session leader (via `child_setup'), so the run subprocess and
+every descendant in its session share the pgrp; the escalation
+chain therefore reaps grandchildren too (TASK-18400 verifies this).
+
+Liveness checks at each step use `--pgrp-has-procs-p' rather than
+`process-live-p' on the immediate child Emacs subprocess.  A
+backgrounded grandchild whose parent shell exited on SIGINT remains
+in the pgrp but is no longer an Emacs-tracked process; the pgrp
+check still sees it and triggers the next signal level.  Errors
+from `signal-process' (e.g., the kernel already reaped the pgrp)
+are caught with `ignore-errors' so a race between exit and signal
+does not propagate.
+
+STATE is the run-state hash table populated by the `run' handler.
+Returns nil unconditionally.  Idempotent: calling twice schedules
+two escalation chains, but both converge on the same outcome once
+the pgrp is empty.  The terminal-cause CAS gates the cancellation
+paths so in practice this function is called at most once per run."
+  (let ((pgrp (gethash 'pgrp state))
+        (proc (gethash 'subprocess state)))
+    (when (firefox-to-emacs-native-messenger--pgrp-has-procs-p pgrp)
+      (firefox-to-emacs-native-messenger--log
+       'info "signal-escalate: SIGINT to pgrp %d on %S" pgrp proc)
+      (ignore-errors (signal-process (- pgrp) 'int))
+      (run-at-time
+       firefox-to-emacs-native-messenger-run-sigint-grace nil
+       (lambda ()
+         (when (firefox-to-emacs-native-messenger--pgrp-has-procs-p pgrp)
+           (firefox-to-emacs-native-messenger--log
+            'info "signal-escalate: SIGTERM to pgrp %d on %S" pgrp proc)
+           (ignore-errors (signal-process (- pgrp) 'term))
+           (run-at-time
+            firefox-to-emacs-native-messenger-run-sigterm-grace nil
+            (lambda ()
+              (when (firefox-to-emacs-native-messenger--pgrp-has-procs-p pgrp)
+                (firefox-to-emacs-native-messenger--log
+                 'warn "signal-escalate: SIGKILL to pgrp %d on %S" pgrp proc)
+                (ignore-errors (signal-process (- pgrp) 'kill))))))))))
+  nil)
+
+(defun firefox-to-emacs-native-messenger--run-accumulator-filter (proc string)
+  "Process filter accumulating STRING into the run-state hash table on PROC.
+
+PROC is the run subprocess; STRING is the raw bytes most recently
+emitted via the combined stdout+stderr stream (`:stderr nil' in
+`make-process' merges stderr into stdout at the OS level).  The
+filter:
+
+  1. Resolves the run-state hash table via `process-get' on
+     `firefox-to-emacs-native-messenger--subprocess-key-run-state'.
+  2. Appends STRING to the `output-buffer' field.
+  3. Increments `output-bytes' by `(length string)' (byte count of
+     the unibyte chunk).
+  4. If `output-bytes' now exceeds `output-cap', attempts the CAS
+     transition `terminal-cause' nil -> `\\='overflow'.  On
+     successful CAS (the first observer wins), invokes
+     `firefox-to-emacs-native-messenger--run-signal-escalate' to
+     terminate the subprocess.  On unsuccessful CAS (a prior path
+     already claimed the terminal cause), skips the escalation step
+     to preserve the first-writer-wins invariant per PAT-0700.
+
+The filter NEVER emits a wire response itself; the subprocess
+sentinel observes the eventual exit and routes the response per
+PAT-0700's terminal-cause branching.
+
+Defensively: if PROC's run-state property is unset (the filter was
+attached but the handler aborted before populating state, or the
+plist was cleared by a prior teardown), the filter is a silent
+no-op.  A zero-byte STRING is accumulated normally (no advance of
+counters) so the cap check remains correct.
+
+Returns nil unconditionally."
+  (let ((state (process-get
+                proc
+                firefox-to-emacs-native-messenger--subprocess-key-run-state)))
+    (when (hash-table-p state)
+      (let* ((buf (or (gethash 'output-buffer state) (unibyte-string)))
+             (chunk-len (length string))
+             (new-buf (concat buf string))
+             (prev-bytes (or (gethash 'output-bytes state) 0))
+             (new-bytes (+ prev-bytes chunk-len))
+             (cap (gethash 'output-cap state)))
+        (puthash 'output-buffer new-buf state)
+        (puthash 'output-bytes new-bytes state)
+        (when (and (integerp cap) (> new-bytes cap))
+          (when (firefox-to-emacs-native-messenger--run-state-cas-terminal-cause
+                 state 'overflow)
+            (firefox-to-emacs-native-messenger--log
+             'warn "run output-cap %d exceeded on %S; escalating" cap proc)
+            (firefox-to-emacs-native-messenger--run-signal-escalate state))))))
+  nil)
+
+(defun firefox-to-emacs-native-messenger--run-build-response (state cause)
+  "Build the wire response for a terminated run based on CAUSE.
+
+STATE is the run-state hash table; CAUSE is the symbol from
+`terminal-cause' after the sentinel observes exit.  Per PAT-0700
+and PROTOCOL.md Sections 3.2.6, 10, 11, and 15:
+
+  - `normal-zero' / `normal-nonzero': returns
+    ((cmd . \"run\") (command . CMD) (content . OUTPUT) (code . EXIT))
+    where CMD is the request's command string (echoed verbatim),
+    OUTPUT is the captured output-buffer decoded as UTF-8 (lenient
+    decoding preserves non-UTF-8 bytes as raw), and EXIT is the
+    subprocess's exit status from `process-exit-status'.
+  - `overflow': returns the generic error shape with
+    `\"response too large\"' wording (PROTOCOL.md Section 11).
+  - `timeout': returns the generic error shape with
+    `\"run timeout exceeded\"' wording (PROTOCOL.md Section 15).
+  - any other CAUSE (defensive): returns a generic error naming
+    the unexpected value.
+
+The function does NOT consider `connection-loss' because the
+sentinel's branching short-circuits that case before calling here.
+
+Decoding the captured unibyte buffer to multibyte UTF-8 happens
+here (not in the serializer) so the response object is fully
+specified at build time; downstream serialization can rely on the
+content being a proper multibyte string."
+  (cl-case cause
+    ((normal-zero normal-nonzero)
+     (let* ((command-string (gethash 'command-string state))
+            (raw-bytes (or (gethash 'output-buffer state) (unibyte-string)))
+            (sub (gethash 'subprocess state))
+            (exit (if (processp sub) (process-exit-status sub) 0))
+            (content (decode-coding-string raw-bytes 'utf-8)))
+       (list (cons 'cmd "run")
+             (cons 'command command-string)
+             (cons 'content content)
+             (cons 'code (or exit 0)))))
+    ((overflow)
+     (firefox-to-emacs-native-messenger--build-error-response
+      "response too large"))
+    ((timeout)
+     (firefox-to-emacs-native-messenger--build-error-response
+      "run timeout exceeded"))
+    (t
+     (firefox-to-emacs-native-messenger--build-error-response
+      (format "internal error: unknown terminal-cause %S" cause)))))
+
+(defun firefox-to-emacs-native-messenger--run-subprocess-sentinel (proc event)
+  "Sentinel for the run subprocess; dispatches the wire response on exit.
+
+Invoked by Emacs on every state transition of PROC; reacts only to
+terminal events (`exit' or `signal' status).  Non-terminal events
+(e.g., \"open\") are silently ignored.
+
+On a terminal event:
+
+  1. Resolves the run-state hash table via `process-get' on the
+     subprocess-key defconst; if absent (defensive), bails out.
+  2. Cancels any pending `timeout-timer' field via the nil-tolerant
+     `--cancel-timer' helper and clears the field.
+  3. If `terminal-cause' is still unset, CAS-sets it to
+     `normal-zero' or `normal-nonzero' based on
+     `process-exit-status'.
+  4. Branches on the final `terminal-cause':
+     - `connection-loss': logs and returns without writing.
+       The connection has already been torn down by the connection
+       sentinel; emitting a frame would either fail (peer gone) or
+       be dropped by the writer's pre-send guard, so we skip the
+       call entirely.
+     - any other cause: builds the response via
+       `--run-build-response' and routes it through
+       `--write-response' on the connection.  The writer's
+       pre-send guard handles double-send protection if the
+       sentinel were to fire more than once.
+
+EVENT is accepted for sentinel-API uniformity; the function
+inspects `process-status' rather than event text to determine
+termination, which is more robust against textual event-string
+variations across Emacs versions.
+
+Returns nil unconditionally."
+  (when (memq (process-status proc) '(exit signal))
+    (let ((state (process-get
+                  proc
+                  firefox-to-emacs-native-messenger--subprocess-key-run-state)))
+      (when (hash-table-p state)
+        (firefox-to-emacs-native-messenger--cancel-timer
+         (gethash 'timeout-timer state))
+        (puthash 'timeout-timer nil state)
+        (unless (gethash 'terminal-cause state)
+          (let ((exit (process-exit-status proc)))
+            (firefox-to-emacs-native-messenger--run-state-cas-terminal-cause
+             state
+             (if (and (integerp exit) (zerop exit))
+                 'normal-zero
+               'normal-nonzero))))
+        (let ((cause (gethash 'terminal-cause state))
+              (conn (gethash 'connection state))
+              (trimmed (if (stringp event) (string-trim event) "")))
+          (cond
+           ((eq cause 'connection-loss)
+            (firefox-to-emacs-native-messenger--log
+             'info
+             "run subprocess exited under connection-loss; no response (event: %s)"
+             trimmed))
+           (t
+            (let ((response
+                   (firefox-to-emacs-native-messenger--run-build-response
+                    state cause)))
+              (firefox-to-emacs-native-messenger--log
+               'info
+               "run subprocess terminal cause=%S; dispatching response on %S"
+               cause conn)
+              (when (and (processp conn) (process-live-p conn))
+                (firefox-to-emacs-native-messenger--write-response
+                 conn response)))))))))
+  nil)
+
+(defun firefox-to-emacs-native-messenger--run-timeout-expire (state)
+  "Run-timeout timer expiration handler.
+
+Invoked when the per-run timeout timer fires (only relevant when
+the `firefox-to-emacs-native-messenger-run-timeout' defcustom was
+set to a positive number at run start).  The handler:
+
+  1. Attempts the CAS transition `terminal-cause' nil -> `\\='timeout'.
+  2. On successful CAS (the timeout step claims the terminal cause
+     first), invokes
+     `firefox-to-emacs-native-messenger--run-signal-escalate' to
+     terminate the subprocess.
+  3. On unsuccessful CAS (the cause is already set by the sentinel,
+     the accumulator filter, or the connection sentinel), the
+     handler is a silent no-op so escalation is not re-triggered.
+
+The signal-escalation chain ends with SIGKILL; the resulting
+subprocess exit fires the run subprocess sentinel which builds the
+`run timeout exceeded' error response per PROTOCOL.md Section 15.
+
+STATE is the run-state hash table.  Returns nil unconditionally."
+  (when (firefox-to-emacs-native-messenger--run-state-cas-terminal-cause
+         state 'timeout)
+    (firefox-to-emacs-native-messenger--log
+     'warn "run timeout exceeded on %S; escalating"
+     (gethash 'subprocess state))
+    (firefox-to-emacs-native-messenger--run-signal-escalate state))
+  nil)
+
+(defun firefox-to-emacs-native-messenger--run-timeout-schedule (state)
+  "Schedule a run-timeout timer on STATE if the timeout defcustom is non-nil.
+
+Reads `firefox-to-emacs-native-messenger-run-timeout' fresh; if it
+is a positive number, schedules a one-shot timer firing after that
+many seconds whose callback invokes `--run-timeout-expire' on
+STATE.  The timer object is stored in STATE's `timeout-timer'
+field for later cancellation by the subprocess sentinel or
+connection sentinel.
+
+If the defcustom is nil, zero, or negative the function is a
+silent no-op and STATE's `timeout-timer' field remains nil.  This
+makes the run handler's schedule call unconditional: the absence
+of a timeout simply means no timer fires.
+
+Returns the scheduled timer object or nil when no timer was
+created."
+  (let ((seconds firefox-to-emacs-native-messenger-run-timeout))
+    (when (and (numberp seconds) (> seconds 0))
+      (puthash 'timeout-timer
+               (run-at-time
+                seconds nil
+                (lambda ()
+                  (firefox-to-emacs-native-messenger--run-timeout-expire
+                   state)))
+               state))))
+
+(defun firefox-to-emacs-native-messenger--run-handler (client request)
+  "Implement the `run' cmd per PROTOCOL.md Sections 5, 10, 11, 15, 16.
+
+Composition order per REQ-3300:
+
+  1. Field validation: `command' MUST be a non-nil string.  Missing,
+     null, or non-string `command' returns the generic error
+     response `\"missing required field: command\"' without any
+     side effects.  `content' is optional; if absent or non-string,
+     defaults to the empty string.
+  2. Per-gate VALIDATOR (PAT-1100 site 3) on the current
+     `firefox-to-emacs-native-messenger-run-whitelist'.  Malformed
+     defcustom values signal `whitelist-malformed' from inside
+     `--run-gate-match-p'; the handler catches and emits the generic
+     error with the validator's wording.
+  3. Command-gate MATCH per Section 8.10.  On a miss, returns the
+     generic error `\"command not in whitelist\"' BEFORE any
+     subprocess is spawned.
+  4. Subprocess launch via
+     `firefox-to-emacs-native-messenger--run-handler--launch':
+     creates the subprocess via `make-process' (no external `setsid'
+     wrapper; Emacs's `child_setup' already creates each subprocess
+     as its own session and process-group leader);
+     captures pgrp via `process-attributes' with PID fallback;
+     populates the run-state hash table; cross-links the connection
+     and subprocess via plist keys; transitions the connection
+     state to `dispatched' (so the dispatcher does NOT call
+     `--write-response' for this request); schedules the
+     run-timeout timer if the defcustom is non-nil; sends
+     `content' to stdin followed by EOF (EPIPE tolerated and
+     logged); returns a placeholder response that the dispatcher
+     discards.
+
+The eventual wire response is produced by the run subprocess
+sentinel observing exit and routed via `--write-response' on the
+connection.  The connection sentinel's run-cancellation extension
+(Phase 0800) handles peer close in the `dispatched' state.
+
+CLIENT is the listener-side accepted client process (a network
+process); REQUEST is the parsed JSON alist with at least `cmd' and
+`command' keys.  Returns a response alist suitable for the
+dispatcher to inspect, even though the dispatcher will not write
+it because the connection state is now `dispatched'."
+  (let ((cmd-pair (assq 'command request))
+        (content-pair (assq 'content request)))
+    (cond
+     ((or (null cmd-pair) (not (stringp (cdr cmd-pair))))
+      (firefox-to-emacs-native-messenger--build-error-response
+       "missing required field: command"))
+     (t
+      (firefox-to-emacs-native-messenger--run-handler--gated
+       client
+       (cdr cmd-pair)
+       (or (and content-pair (stringp (cdr content-pair))
+                (cdr content-pair))
+           ""))))))
+
+(defun firefox-to-emacs-native-messenger--run-handler--gated
+    (client command-string content)
+  "Apply gate composition then launch the subprocess.
+
+Per REQ-3300 ordering: whitelist VALIDATOR (raised from inside the
+gate-match call) -> command-gate MATCH -> launch.  Each rejection
+path returns the generic error response WITHOUT echoing original
+request fields per PAT-0300.
+
+Errors from any sub-step are caught and translated to wire-shape
+generic errors so the caller (`--run-handler') can return them
+directly to the dispatcher."
+  (condition-case err
+      (cond
+       ((not (firefox-to-emacs-native-messenger--run-gate-match-p
+              command-string))
+        (firefox-to-emacs-native-messenger--build-error-response
+         "command not in whitelist"))
+       (t
+        (firefox-to-emacs-native-messenger--run-handler--launch
+         client command-string content)))
+    (firefox-to-emacs-native-messenger-whitelist-malformed
+     (firefox-to-emacs-native-messenger--build-error-response
+      (format "whitelist malformed: %s" (error-message-string err))))
+    (firefox-to-emacs-native-messenger-bad-state
+     (firefox-to-emacs-native-messenger--build-error-response
+      (error-message-string err)))))
+
+(defun firefox-to-emacs-native-messenger--run-handler--launch
+    (client command-string content)
+  "Launch the run subprocess and link CLIENT to its run-state.
+
+Implements the launch mechanics per PAT-0800 and Section 8.19:
+
+  - `default-directory' is let-bound to `~/' so the subprocess
+    inherits the user's home as its cwd.
+  - `make-process' invocation: `:command' is `(SHELL SHELL-SWITCH
+    COMMAND-STRING)' (e.g., `(\"/bin/sh\" \"-c\" COMMAND-STRING)').  No
+    external `setsid' wrapper is used: Emacs's `child_setup' calls
+    `setsid(2)' on every async subprocess before exec, so the
+    immediate child is already its own session and process-group
+    leader (`pid == pgrp == sess').  `:coding' is binary; `:stderr'
+    is nil (which merges stderr into stdout at the OS level);
+    `:noquery' is t so the subprocess does not block Emacs exit;
+    `:connection-type' is pipe.  The `--run-accumulator-filter'
+    captures output; the `--run-subprocess-sentinel' dispatches the
+    wire response on exit.
+  - pgrp capture: attempts `(alist-get \\='pgrp (process-attributes
+    PID))'; if that returns nil (subprocess already exited before
+    the call, kernel returned no attributes, etc.), falls back to
+    PID itself.  Because Emacs's `child_setup' creates each
+    subprocess as a session leader, PID == PGID at exec time.  The
+    `pgrp-fallback' boolean records whether the fallback was used
+    for logging.
+  - Run-state hash table: populated with every documented field
+    from Section 8.3, plus the `pgrp-fallback' boolean.
+  - Cross-link: connection's `run-subprocess' plist key points at
+    the subprocess; subprocess's `run-state' plist key points at
+    the hash table.
+  - State transition: connection state set to `dispatched' so the
+    dispatcher does NOT call `--write-response' for this request.
+  - run-timeout-timer: scheduled iff the defcustom is non-nil.
+  - stdin: `process-send-string' followed by
+    `process-send-eof'.  Errors are caught by
+    `condition-case-unless-debug' and logged at info level; they
+    do NOT propagate so the subprocess sentinel still produces the
+    terminal response from the exit observation.
+
+Returns a placeholder response alist that the dispatcher discards
+because the connection state has already moved to `dispatched'."
+  (let* ((default-directory (expand-file-name "~/"))
+         (proc (make-process
+                :name "firefox-to-emacs-native-messenger-run"
+                :command (list firefox-to-emacs-native-messenger-shell-binary
+                               firefox-to-emacs-native-messenger-shell-command-switch
+                               command-string)
+                :coding 'binary
+                :stderr nil
+                :noquery t
+                :connection-type 'pipe
+                :filter
+                #'firefox-to-emacs-native-messenger--run-accumulator-filter
+                :sentinel
+                #'firefox-to-emacs-native-messenger--run-subprocess-sentinel))
+         (pid (process-id proc))
+         (attrs (ignore-errors (process-attributes pid)))
+         (pgrp-from-attrs (and attrs (alist-get 'pgrp attrs)))
+         (pgrp (or pgrp-from-attrs pid))
+         (pgrp-fallback (not (integerp pgrp-from-attrs)))
+         (state (make-hash-table :test 'eq)))
+    (puthash 'terminal-cause nil state)
+    (puthash 'output-buffer (unibyte-string) state)
+    (puthash 'output-bytes 0 state)
+    (puthash 'output-cap firefox-to-emacs-native-messenger-run-output-cap state)
+    (puthash 'subprocess proc state)
+    (puthash 'connection client state)
+    (puthash 'command-string command-string state)
+    (puthash 'pgrp pgrp state)
+    (puthash 'pgrp-fallback pgrp-fallback state)
+    (puthash 'timeout-timer nil state)
+    (process-put proc
+                 firefox-to-emacs-native-messenger--subprocess-key-run-state
+                 state)
+    (process-put client
+                 firefox-to-emacs-native-messenger--connection-key-run-subprocess
+                 proc)
+    (process-put client
+                 firefox-to-emacs-native-messenger--connection-key-state
+                 'dispatched)
+    (firefox-to-emacs-native-messenger--log
+     'info
+     "run launched on %S as %S; cmd=%S pgrp=%d pgrp-fallback=%S"
+     client proc command-string pgrp pgrp-fallback)
+    (firefox-to-emacs-native-messenger--run-timeout-schedule state)
+    (condition-case err
+        (progn
+          (when (> (length content) 0)
+            (process-send-string proc content))
+          (process-send-eof proc))
+      (error
+       (firefox-to-emacs-native-messenger--log
+        'info "run stdin send error on %S: %S" proc err)))
+    (list (cons 'cmd "run-deferred"))))
+
+;;;; Register the five v2 handlers in the dispatcher table.
+;;;; Per REQ-1600, only these five cmds are implemented; every other
+;;;; cmd falls through to "Unhandled message".  Phase 0800 adds
+;;;; `run' (the async / deferred-response handler).
 
 (puthash "version"
          #'firefox-to-emacs-native-messenger--version-handler
@@ -1975,6 +2643,9 @@ failure produces the upstream `read' open-failure shape (`content =
          firefox-to-emacs-native-messenger--handlers)
 (puthash "read"
          #'firefox-to-emacs-native-messenger--read-handler
+         firefox-to-emacs-native-messenger--handlers)
+(puthash "run"
+         #'firefox-to-emacs-native-messenger--run-handler
          firefox-to-emacs-native-messenger--handlers)
 
 ;;;###autoload
