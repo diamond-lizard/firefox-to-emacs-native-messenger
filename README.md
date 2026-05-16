@@ -39,14 +39,14 @@ Every other upstream cmd (`write`, `writerc`, `mkdir`, `move`, `list_dir`, `env`
 
 ## 2. Prerequisites
 
-- Linux (validated on Void Linux; other Linux distributions are very likely to work but are not validated).
+- Linux (validated on Void Linux; other Linux distributions are very likely to work but are not validated; see [Section 8](#8-porting-notes) for porting notes including macOS).
 - Emacs 30.1 or newer, running as a long-lived user daemon (`emacs --daemon`).
 - `socat` on `PATH`.
 - GNU coreutils (`date` with `%N` nanoseconds, `mv -n`, `sha256sum`, `mkdir -p`, `ln`) for the install rules.
 - A writable home directory.  The runtime cache directory is `~/.cache/firefox-to-emacs-native-messenger/` at mode 0700; the bridge creates it if absent and refuses to start if it exists at a different mode.
 - Firefox with Tridactyl installed.
 
-This project is x86_64-only (the little-endian length-prefix codec is wired explicitly).  Windows and macOS are out of scope.  Multi-profile Firefox is out of scope.
+This project targets little-endian architectures; the length-prefix codec is wired explicitly little-endian, so x86_64 and Apple Silicon both work in principle.  Big-endian platforms are out of scope.  Windows is out of scope; macOS is not validated but likely portable (see [Section 8](#8-porting-notes)).  Multi-profile Firefox is out of scope.
 
 ## 3. Install Order
 
@@ -105,7 +105,7 @@ Before activating the Firefox manifest, confirm the bridge works end-to-end by s
 printf '\x10\x00\x00\x00{"cmd":"version"}' | ~/bin/firefox-to-emacs-native-messenger-wrapper
 ```
 
-You should see a framed JSON response on stdout containing the version string and `"code":0`.  If you do not, see [Section 9](#9-troubleshooting).
+You should see a framed JSON response on stdout containing the version string and `"code":0`.  If you do not, see [Section 10](#10-troubleshooting).
 
 ### 3.7 Activate the Firefox manifest
 
@@ -236,7 +236,7 @@ Two whitelist defcustoms gate the two non-trivial handlers:
 
 Both default to `nil`, which means **deny everything**.  Until you configure them, every `run` request returns "command not in whitelist" and every `read` request returns "path not in whitelist".
 
-The remaining four in-scope handlers (`version`, `getconfigpath`, `getconfig`, `temp`) are ungated and need no configuration; their security boundaries are documented in [Section 8](#8-security).
+The remaining four in-scope handlers (`version`, `getconfigpath`, `getconfig`, `temp`) are ungated and need no configuration; their security boundaries are documented in [Section 9](#9-security).
 
 ### 6.2 Whitelist value shapes
 
@@ -359,8 +359,8 @@ If you frequently source specific files, add their paths (or a covering glob) to
 
 ## 7. Known Limitations
 
-- **Linux only.**  Other Linux distributions are likely to work but only Void Linux is validated.  Windows and macOS are out of scope.
-- **x86_64 only.**  The little-endian length-prefix codec is wired explicitly.
+- **Validated on Linux only.**  Only Void Linux is validated.  Other Linux distributions are likely to work as-is.  macOS is likely to work with a small set of patches documented in [Section 8](#8-porting-notes).  Windows is out of scope.
+- **x86_64 and Apple Silicon supported in principle.**  The little-endian length-prefix codec is wired explicitly; both x86_64 and Apple Silicon are little-endian and would interoperate.  Big-endian platforms are out of scope.
 - **Six handlers only.**  Implemented: `version`, `getconfigpath`, `getconfig`, `temp`, `read`, `run`.  Other Tridactyl features break with "Unhandled message" — notably `:restart`, `:installnative`, `:pyeval`, and any flow that depends on `write`, `writerc`, `mkdir`, `move`, `list_dir`, `env`, `ppid`, `run_async`, or `eval`.
 - **`:viewconfig --user`** is independent of this bridge: it dumps in-memory `config.USERCONFIG` and does not consume `getconfigpath`.  It works regardless of bridge state.
 - **Default-deny whitelists.**  `run` and `read` require user configuration before they work.  `version`, `getconfigpath`, `getconfig`, and `temp` are ungated and work out of the box.
@@ -369,9 +369,41 @@ If you frequently source specific files, add their paths (or a covering glob) to
 - **Capability registry does not survive listener restart.**  Paths returned by `temp` are tracked in memory only; restarting the listener clears the registry, after which `<TEMP-PATH>`-marker matches against previously-issued paths will fail.
 - **Concurrent multi-profile Firefox is out of scope.**  The bridge assumes a single user-managed daemon and a single Firefox profile.
 
-## 8. Security
+## 8. Porting Notes
 
-### 8.1 Stance
+Only Linux (specifically Void Linux) is validated.  The codebase is mostly portable, but several integration points are Linux-specific.  This section documents what would have to change for each non-Linux target.  Patches welcome.
+
+### 8.1 macOS
+
+Likely to work with the changes below.  Not validated.
+
+**Portable as-is:**
+
+- The Emacs Lisp bridge module.  It uses only Emacs built-ins, Unix-domain sockets, and `make-process` / `make-network-process`, all cross-platform on Emacs 30.1.
+- The POSIX-shell wrapper.  Mac's `/bin/sh` is bash and the script is POSIX-clean.
+- `socat`.  Available via `brew install socat`.
+- The tempfile directory under `/tmp`.  Mac's `/tmp` (symlink to `/private/tmp`) behaves the same way.
+- Process-group cancellation in `run`.  Emacs's `child_setup` calls `setsid` on macOS subprocesses, matching the Linux behavior the cancellation logic depends on.
+
+**Would need changes:**
+
+1. **Firefox manifest path.**  macOS Firefox looks for native-messaging manifests under `~/Library/Application Support/Mozilla/NativeMessagingHosts/`, not under `~/.mozilla/native-messaging-hosts/`.  The Makefile's `MANIFEST_TARGET` hardcodes the Linux path; an OS-detection branch is needed for `make activate` to install the manifest where macOS Firefox will find it.
+2. **GNU coreutils dependencies in the Makefile.**  The activate rule's timestamped-backup naming uses `date %N` (nanoseconds) and its content-comparison uses `sha256sum`.  BSD `date` on macOS does not support `%N`; macOS ships `shasum -a 256` instead of `sha256sum`.  Either install GNU coreutils via `brew install coreutils` and call `gdate` / `gsha256sum`, or shim the two calls with a platform-detection wrapper.
+3. **Cache directory convention.**  The runtime cache lives at `~/.cache/firefox-to-emacs-native-messenger/`.  This path works on macOS but is not the Mac convention (`~/Library/Caches/...`).  No code change is required; the README's cache-path references would be more idiomatic if they branched on platform.
+
+**Apple Silicon (M1/M2/...):**  The little-endian length-prefix codec works unchanged.  Apple Silicon is little-endian, matching x86_64 byte order on this point.
+
+### 8.2 Other Linux distributions
+
+Likely to work as-is on any modern glibc-based or musl-based distribution.  The bridge relies on standard POSIX semantics for Unix-domain sockets, `setsid`, `signal-process` to a process group, and basic shell utilities.  The Makefile assumes GNU coreutils; distributions whose default coreutils are BusyBox or another non-GNU implementation may need shims for `date %N` and `sha256sum`, the same patches as for macOS.
+
+### 8.3 Windows
+
+Out of scope and unlikely to work without substantial rework.  Firefox on Windows uses a registry-based manifest discovery mechanism, not a filesystem path; `socat` is not idiomatic; the POSIX-shell wrapper would need a different launcher.
+
+## 9. Security
+
+### 9.1 Stance
 
 This bridge tightens the threat model relative to the upstream Nim messenger: upstream's `run` handler is unconditional shell execution; this bridge gates `run` behind a user-authored whitelist.  A compromised Tridactyl extension can no longer run arbitrary shell commands through the bridge.
 
@@ -379,11 +411,11 @@ This bridge tightens the threat model relative to the upstream Nim messenger: up
 
 When you author a whitelist entry, ask: "If an attacker controls the request fields and the corresponding `<TEMP-PATH>` contents, what's the worst they can do?"  If the answer is "open my editor with arbitrary text," that's probably acceptable.  If it's "execute arbitrary code," reconsider.
 
-### 8.2 Forward-compatible sandboxing
+### 9.2 Forward-compatible sandboxing
 
 The bridge does not sandbox subprocesses itself; sandboxing belongs in a layer the user can compose.  Concretely: instead of whitelisting `emacsclient <TEMP-PATH>`, you can whitelist `firejail --net=none emacsclient <TEMP-PATH>` (or `bwrap`, `nsjail`, etc.) so the editor runs under the sandbox's restrictions.  The whitelist matcher treats the sandbox prefix as opaque literal text and forwards everything past it to the editor.
 
-### 8.3 Other security properties
+### 9.3 Other security properties
 
 - TRAMP and remote paths are rejected in any path-accepting handler before any I/O is attempted.
 - Inbound frames are capped (default 10 mebibytes); oversized frames cause a silent connection close with a log entry.
@@ -392,9 +424,9 @@ The bridge does not sandbox subprocesses itself; sandboxing belongs in a layer t
 - The runtime cache directory and the tempfile directory must exist at exactly mode 0700; the listener refuses to start otherwise.
 - The `getconfig` handler enforces a file-UID equality check: candidate rc files whose UID differs from the daemon's UID are treated as IOError without disclosing content.
 
-## 9. Troubleshooting
+## 10. Troubleshooting
 
-### 9.1 Smoke test fails with no response
+### 10.1 Smoke test fails with no response
 
 If the smoke test in [Section 3.6](#36-smoke-test-before-activation) produces no output:
 
@@ -403,7 +435,7 @@ If the smoke test in [Section 3.6](#36-smoke-test-before-activation) produces no
 - Confirm `socat` is on `PATH` (`command -v socat`).
 - Check the bridge log buffer for connection accept events.
 
-### 9.2 Listener refuses to start
+### 10.2 Listener refuses to start
 
 Common causes:
 
@@ -411,19 +443,19 @@ Common causes:
 - A whitelist defcustom contains a malformed value.  The error message identifies the violation; correct the value via `customize-set-variable` or `setq` and try again.
 - A stale socket file exists from a crashed previous listener.  The listener probes for a live peer and unlinks stale sockets automatically; if it refuses anyway, the path may have become a regular file or symlink (which the listener refuses to unlink for safety).  Remove the file manually only after confirming it is yours and not a still-running listener.
 
-### 9.3 Tridactyl reports "no native messenger"
+### 10.3 Tridactyl reports "no native messenger"
 
 - Confirm `~/.mozilla/native-messaging-hosts/tridactyl.json` exists and points at this project's manifest: `readlink ~/.mozilla/native-messaging-hosts/tridactyl.json`.
 - Confirm the wrapper at `~/bin/firefox-to-emacs-native-messenger-wrapper` is on Firefox's effective `PATH` (Firefox restricts the PATH it consults for native-messaging hosts; `~/bin` is typically included via the user's login shell environment, but headless or sandboxed Firefox processes may not see it).
 - Restart Firefox after activation; Firefox caches its manifest list.
 
-### 9.4 Run requests are rejected even though the whitelist looks correct
+### 10.4 Run requests are rejected even though the whitelist looks correct
 
 - Confirm the request matches the whitelist entry byte-for-byte, including spaces and quotes.  Tridactyl's editor flow includes single quotes around the path in some commands.
 - Confirm the `<TEMP-PATH>` substring is in the capability registry: a previous `temp` call must have produced that exact path within the current listener lifetime.  If the listener restarted between the `temp` call and the `run` call, the path is no longer registered.
 - Increase the log level to `debug` temporarily to see gate-check details: `(setq firefox-to-emacs-native-messenger-log-level 'debug)`.
 
-## 10. References
+## 11. References
 
 - [PROTOCOL.md](PROTOCOL.md) — the per-command request and response contract.
 - Mozilla WebExtensions Native Messaging specification: https://developer.mozilla.org/en-US/docs/Mozilla/Add-ons/WebExtensions/Native_messaging
