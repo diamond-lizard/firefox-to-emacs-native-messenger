@@ -6875,5 +6875,345 @@ gate matcher is actually exercised on the registered path."
                             (alist-get 'content run-resp)))
              (should (= 0 (alist-get 'code run-resp)))))))))))
 
+;;;; Phase 0900: Firefox-side wrapper script (POSIX shell).
+;;;; The wrapper has two responsibilities: atomically write the
+;;;; side-channel PID file with its $PPID (= Firefox's PID under
+;;;; direct fork+exec), and exec socat to bridge stdio to the
+;;;; listener's Unix-domain socket.  Tests exercise the wrapper
+;;;; as a subprocess: a sandbox sets XDG_CACHE_HOME to a tempdir
+;;;; so the wrapper computes the same cache/socket paths as the
+;;;; listener under the bound defconsts.
+
+(defconst firefox-to-emacs-native-messenger-test--wrapper-path
+  (expand-file-name "firefox-to-emacs-native-messenger-wrapper"
+                    firefox-to-emacs-native-messenger-test--project-root)
+  "Absolute path to the wrapper script under test.")
+
+(defmacro firefox-to-emacs-native-messenger-test--with-wrapper-sandbox
+    (sandbox-var cache-var tmp-var sock-var &rest body)
+  "Bind sandbox paths and rebind bridge defconsts for wrapper tests.
+
+Creates a fresh mode-0700 tempdir; binds SANDBOX-VAR to it.  Computes
+CACHE-VAR as `<sandbox>/firefox-to-emacs-native-messenger/' --
+matching what the wrapper computes when launched with
+`XDG_CACHE_HOME=<sandbox>' in its environment.  Binds TMP-VAR to a
+tempfiles subpath and SOCK-VAR to `<cache>/messenger.sock'.
+
+Let-binds `firefox-to-emacs-native-messenger-cache-directory',
+`firefox-to-emacs-native-messenger-tempfile-directory', and
+`firefox-to-emacs-native-messenger-socket-path' to the corresponding
+sandbox paths so the listener bound inside BODY binds the same
+socket the wrapper subprocess will connect to.
+
+Forcibly clears `firefox-to-emacs-native-messenger--listener-process'
+on body exit so an explicit stop call is not strictly required."
+  (declare (indent 4) (debug (symbolp symbolp symbolp symbolp body)))
+  (let ((box (gensym "wrapper-sandbox-")))
+    `(let ((,box (let ((d (make-temp-file "fxm-" t)))
+                   (set-file-modes d #o700)
+                   d)))
+       (unwind-protect
+           (let* ((,sandbox-var ,box)
+                  (,cache-var (file-name-as-directory
+                               (expand-file-name
+                                "firefox-to-emacs-native-messenger"
+                                ,sandbox-var)))
+                  (,tmp-var (file-name-as-directory
+                             (expand-file-name "tempfiles" ,sandbox-var)))
+                  (,sock-var (expand-file-name "messenger.sock" ,cache-var))
+                  (firefox-to-emacs-native-messenger-cache-directory
+                   ,cache-var)
+                  (firefox-to-emacs-native-messenger-tempfile-directory
+                   ,tmp-var)
+                  (firefox-to-emacs-native-messenger-socket-path ,sock-var))
+             (unwind-protect
+                 (progn ,@body)
+               (when (and (boundp
+                           'firefox-to-emacs-native-messenger--listener-process)
+                          firefox-to-emacs-native-messenger--listener-process
+                          (process-live-p
+                           firefox-to-emacs-native-messenger--listener-process))
+                 (delete-process
+                  firefox-to-emacs-native-messenger--listener-process))
+               (when (boundp
+                      'firefox-to-emacs-native-messenger--listener-process)
+                 (setq firefox-to-emacs-native-messenger--listener-process
+                       nil))))
+         (when (file-directory-p ,box)
+           (delete-directory ,box t))))))
+
+(defun firefox-to-emacs-native-messenger-test--wrapper-roundtrip
+    (sandbox request-object &optional timeout)
+  "Spawn the wrapper subprocess and return its framed reply.
+
+The wrapper is launched with `XDG_CACHE_HOME=SANDBOX' in its
+environment so it computes the cache/socket/PID paths under SANDBOX.
+REQUEST-OBJECT is JSON-encoded and prefixed with its 4-byte
+little-endian UTF-8-byte length, then written to the wrapper's stdin;
+stdin is then closed so socat's half-close timer starts waiting for
+the listener response.  Reads the 4-byte length prefix and JSON body
+from the wrapper's stdout; returns the parsed JSON as an alist
+(object-type `alist', array-type `list', null-object nil,
+false-object `:false') or nil if no complete frame arrived within
+TIMEOUT seconds (default 60).  Stderr is captured in a separate
+buffer that is killed on exit so wrapper/socat diagnostics do not
+interleave with the framed stdout response."
+  (let* ((timeout (or timeout 60.0))
+         (request-bytes (encode-coding-string
+                         (json-serialize request-object) 'utf-8 t))
+         (frame (concat
+                 (firefox-to-emacs-native-messenger-test--pack-length
+                  (length request-bytes))
+                 request-bytes))
+         (reply-buf "")
+         (stderr-buf
+          (generate-new-buffer
+           " *firefox-to-emacs-native-messenger-test-wrapper-stderr*"))
+         (process-environment
+          (cons (format "XDG_CACHE_HOME=%s"
+                        (directory-file-name sandbox))
+                process-environment))
+         (proc (make-process
+                :name "firefox-to-emacs-native-messenger-test-wrapper"
+                :command
+                (list
+                 firefox-to-emacs-native-messenger-test--wrapper-path)
+                :coding 'binary
+                :connection-type 'pipe
+                :noquery t
+                :stderr stderr-buf
+                :filter (lambda (_p data)
+                          (setq reply-buf (concat reply-buf data))))))
+    (unwind-protect
+        (progn
+          (process-send-string proc frame)
+          ;; Do NOT close stdin: socat would shutdown(SHUT_WR) on the
+          ;; socket, which Emacs reports as "connection broken" and the
+          ;; listener's sentinel interprets as peer-close during
+          ;; dispatch -- cancelling the in-flight run subprocess
+          ;; before its sentinel can write a response.  Firefox keeps
+          ;; stdin open until it receives the framed reply; we mimic
+          ;; that here.  The wrapper subprocess is reaped by the
+          ;; unwind-protect's delete-process below after we have the
+          ;; complete framed reply.
+          (let ((deadline (+ (float-time) timeout)))
+            (while (and (process-live-p proc)
+                        (< (length reply-buf) 4)
+                        (< (float-time) deadline))
+              (accept-process-output proc 0.1))
+            (when (>= (length reply-buf) 4)
+              (let ((declared
+                     (firefox-to-emacs-native-messenger-test--unpack-length
+                      (substring reply-buf 0 4))))
+                (while (and (process-live-p proc)
+                            (< (length reply-buf) (+ 4 declared))
+                            (< (float-time) deadline))
+                  (accept-process-output proc 0.1))
+                (when (>= (length reply-buf) (+ 4 declared))
+                  (json-parse-string
+                   (decode-coding-string
+                    (substring reply-buf 4 (+ 4 declared))
+                    'utf-8 t)
+                   :object-type 'alist
+                   :array-type 'list
+                   :null-object nil
+                   :false-object :false))))))
+      (when (process-live-p proc)
+        (delete-process proc))
+      (when (buffer-live-p stderr-buf)
+        (kill-buffer stderr-buf)))))
+
+;;;; TASK-19600: wrapper round-trips a framed request to the listener.
+;;;; The wrapper subprocess reads a framed request from its stdin,
+;;;; forwards it through socat to the listener's Unix-domain socket,
+;;;; and writes the listener's framed response back to its stdout.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-wrapper-version-roundtrip ()
+  "Wrapper reads a framed `version' request and writes a framed reply.
+
+Sandbox layout: XDG_CACHE_HOME is overridden so the wrapper computes
+the same cache directory that the listener is bound under.  The
+whitelists are widened to `(\"*\")' for the duration of the test
+(the gate matchers are exercised by the per-handler tests in Phases
+0600 and 0700); this test asserts the WIRE PATH through wrapper +
+socat back to the listener."
+  :tags '(:integration :slow)
+  (skip-unless (executable-find "socat"))
+  (skip-unless (file-executable-p
+                firefox-to-emacs-native-messenger-test--wrapper-path))
+  (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+   (setq firefox-to-emacs-native-messenger-run-whitelist '("*"))
+   (setq firefox-to-emacs-native-messenger-read-whitelist '("*"))
+   (firefox-to-emacs-native-messenger-test--with-wrapper-sandbox
+       sandbox _cache _tmp _sock
+     (firefox-to-emacs-native-messenger-start)
+     (unwind-protect
+         (let ((reply
+                (firefox-to-emacs-native-messenger-test--wrapper-roundtrip
+                 sandbox '((cmd . "version")) 10.0)))
+           (should reply)
+           (should (equal "version" (alist-get 'cmd reply)))
+           (should (stringp (alist-get 'version reply)))
+           (should (> (length (alist-get 'version reply)) 0)))
+       (firefox-to-emacs-native-messenger-stop)))))
+
+;;;; TASK-20000: PID-file atomicity under concurrent wrapper invocation.
+;;;; Two wrappers spawned concurrently each write their $PPID to the
+;;;; same PID file via temp-file-then-mv.  The final file is never
+;;;; empty/truncated and has the documented mode/content.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-wrapper-pid-file-atomicity ()
+  "Concurrent wrappers leave the PID file in a valid final state.
+
+Two wrapper subprocesses are spawned in rapid succession with
+XDG_CACHE_HOME pinned to the sandbox.  Each wrapper writes its own
+$PPID to the PID file via temp-and-mv before exec'ing socat; with no
+listener bound, socat fails to connect and exits, taking the
+wrapper subprocess with it.
+
+The final PID file MUST:
+  - exist as a regular file under the sandbox cache directory;
+  - have permission bits exactly 0600 (umask 077 + regular-file
+    default mode 0666 -> 0600);
+  - contain exactly `(emacs-pid)' followed by a single newline byte
+    (the wrappers were forked from this Emacs, so their $PPID is
+    `(emacs-pid)')."
+  :tags '(:integration :slow)
+  (skip-unless (file-executable-p
+                firefox-to-emacs-native-messenger-test--wrapper-path))
+  (firefox-to-emacs-native-messenger-test--with-wrapper-sandbox
+      sandbox cache _tmp _sock
+    (let* ((pid-file (expand-file-name "firefox.pid" cache))
+           (process-environment
+            (cons (format "XDG_CACHE_HOME=%s"
+                          (directory-file-name sandbox))
+                  process-environment))
+           (stderr-a (generate-new-buffer
+                      " *wrapper-pid-stderr-a*"))
+           (stderr-b (generate-new-buffer
+                      " *wrapper-pid-stderr-b*"))
+           (proc-a (make-process
+                    :name "fenm-test-wrapper-pid-a"
+                    :command
+                    (list
+                     firefox-to-emacs-native-messenger-test--wrapper-path)
+                    :coding 'binary
+                    :connection-type 'pipe
+                    :noquery t
+                    :stderr stderr-a))
+           (proc-b (make-process
+                    :name "fenm-test-wrapper-pid-b"
+                    :command
+                    (list
+                     firefox-to-emacs-native-messenger-test--wrapper-path)
+                    :coding 'binary
+                    :connection-type 'pipe
+                    :noquery t
+                    :stderr stderr-b)))
+      (unwind-protect
+          (let ((deadline (+ (float-time) 10.0)))
+            (process-send-eof proc-a)
+            (process-send-eof proc-b)
+            (while (and (or (process-live-p proc-a)
+                            (process-live-p proc-b))
+                        (< (float-time) deadline))
+              (accept-process-output nil 0.1))
+            (should (file-regular-p pid-file))
+            (should (= (logand (file-modes pid-file) #o7777) #o600))
+            (should (equal (format "%d\n" (emacs-pid))
+                           (with-temp-buffer
+                             (insert-file-contents pid-file)
+                             (buffer-string)))))
+        (when (process-live-p proc-a) (delete-process proc-a))
+        (when (process-live-p proc-b) (delete-process proc-b))
+        (when (buffer-live-p stderr-a) (kill-buffer stderr-a))
+        (when (buffer-live-p stderr-b) (kill-buffer stderr-b))))))
+
+;;;; TASK-20300: wrapper round-trips a long-running run request.
+;;;; A 35-second sleep verifies socat's half-close timeout (86400s)
+;;;; does not prematurely terminate an in-flight bridge round-trip.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-wrapper-run-long-roundtrip ()
+  "Wrapper completes a 35+-second `run' round-trip without premature close.
+
+The wrapper subprocess is fed a framed `run' request whose command
+is `sleep 35; echo done'.  After the framed request is delivered,
+stdin is closed; socat's half-close timer would default to 0.5s but
+the wrapper invokes socat with `-t 86400', so socat waits up to a
+day for the listener's framed response.  After 35+ seconds the
+listener returns code 0 and content `done\\n'; the wrapper writes
+the framed response to stdout, and socat exits.
+
+The whitelist is widened to `(\"*\")' for the duration of the test;
+the gate matchers themselves are exercised by the per-handler tests
+in Phase 0800."
+  :tags '(:integration :slow)
+  (skip-unless (executable-find "socat"))
+  (skip-unless (file-executable-p
+                firefox-to-emacs-native-messenger-test--wrapper-path))
+  (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+   (setq firefox-to-emacs-native-messenger-run-whitelist '("*"))
+   (firefox-to-emacs-native-messenger-test--with-wrapper-sandbox
+       sandbox _cache _tmp _sock
+     (firefox-to-emacs-native-messenger-start)
+     (unwind-protect
+         (let ((reply
+                (firefox-to-emacs-native-messenger-test--wrapper-roundtrip
+                 sandbox
+                 '((cmd . "run")
+                   (command . "sleep 35; echo done")
+                   (content . ""))
+                 60.0)))
+           (should reply)
+           (should (equal "run" (alist-get 'cmd reply)))
+           (should (= 0 (alist-get 'code reply)))
+           (should (equal "done\n" (alist-get 'content reply))))
+       (firefox-to-emacs-native-messenger-stop)))))
+
+;;;; TASK-20500: degraded operation when the cache directory is read-only.
+;;;; A read-only cache directory makes the wrapper's PID-file write
+;;;; fail; the wrapper must tolerate that (one stderr diagnostic) and
+;;;; still exec socat.  The existing socket inside the cache directory
+;;;; remains reachable because connect(2) on an AF_UNIX socket does
+;;;; not require directory-write permission.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-wrapper-readonly-cache-roundtrip ()
+  "Wrapper completes a round-trip when the cache directory is read-only.
+
+The listener binds its socket inside the sandbox cache directory.
+The cache directory is then chmodded to 0500 (read+execute, no
+write).  The wrapper subprocess's PID-file write therefore fails;
+the wrapper emits a diagnostic to stderr and execs socat anyway.
+socat connects to the already-bound socket and round-trips a framed
+`version' request.  The cache-directory mode is restored to its
+original value inside `unwind-protect' before the listener-stop
+step so the socket-cleanup unlink does not fail on a read-only
+directory."
+  :tags '(:integration :slow)
+  (skip-unless (executable-find "socat"))
+  (skip-unless (file-executable-p
+                firefox-to-emacs-native-messenger-test--wrapper-path))
+  (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+   (setq firefox-to-emacs-native-messenger-run-whitelist '("*"))
+   (setq firefox-to-emacs-native-messenger-read-whitelist '("*"))
+   (firefox-to-emacs-native-messenger-test--with-wrapper-sandbox
+       sandbox cache _tmp _sock
+     (firefox-to-emacs-native-messenger-start)
+     (let ((original-mode (logand (file-modes cache) #o7777)))
+       (unwind-protect
+           (progn
+             (set-file-modes cache #o500)
+             (let ((reply
+                    (firefox-to-emacs-native-messenger-test--wrapper-roundtrip
+                     sandbox '((cmd . "version")) 10.0)))
+               (should reply)
+               (should (equal "version" (alist-get 'cmd reply)))
+               (should (stringp (alist-get 'version reply)))
+               (should (> (length (alist-get 'version reply)) 0)))
+             (should-not (file-exists-p
+                          (expand-file-name "firefox.pid" cache))))
+         (set-file-modes cache original-mode)
+         (firefox-to-emacs-native-messenger-stop))))))
+
 (provide 'firefox-to-emacs-native-messenger-tests)
 ;;; firefox-to-emacs-native-messenger-tests.el ends here

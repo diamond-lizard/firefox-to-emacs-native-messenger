@@ -1,0 +1,62 @@
+#!/bin/sh
+# firefox-to-emacs-native-messenger-wrapper.
+#
+# Firefox-side native-messaging host.  Two responsibilities only:
+#
+#   1. Atomically write the side-channel PID file with the wrapper's
+#      $PPID -- which is Firefox's own PID, because Firefox launches
+#      the wrapper via direct fork+exec.
+#   2. Exec socat to bridge stdio to the bridge listener's
+#      Unix-domain socket.
+#
+# Diagnostics during PID-file write failures are emitted to stderr
+# (Firefox discards them) and the wrapper proceeds.  See README.md
+# for installation and operation.
+
+umask 077
+
+# Compute cache directory, PID file, and socket path from the
+# environment, matching Emacs's xdg-cache-home semantics:
+# XDG_CACHE_HOME when set and non-empty, otherwise $HOME/.cache.
+cache_root=${XDG_CACHE_HOME:-$HOME/.cache}
+cache_dir=$cache_root/firefox-to-emacs-native-messenger
+pid_file=$cache_dir/firefox.pid
+socket_path=$cache_dir/messenger.sock
+
+# Create the cache directory if absent.  Under the active umask 077,
+# fresh directory creation yields mode 0700.  If the directory already
+# exists, mkdir -p succeeds silently.  If creation fails (e.g., parent
+# read-only), mkdir's stderr diagnostic is left to surface naturally;
+# the wrapper still proceeds because a pre-existing socket inside an
+# already-created cache_dir remains reachable.
+mkdir -p "$cache_dir"
+
+# Atomically write the side-channel PID file with the wrapper's
+# $PPID (= Firefox's PID, because Firefox launches the wrapper via
+# direct fork+exec).  Write to a unique temp path in the same
+# directory then rename over the final path; mv is atomic within
+# one filesystem, so observers see either the previous content or
+# the new content -- never an empty/partial file.  Tolerate
+# failure: emit one diagnostic to stderr (Firefox discards it) and
+# proceed to exec socat.  A failed PID-file write must not block
+# socat, because the existing socket may still be reachable and
+# the side-channel PID is advisory only.
+pid_tmp=$cache_dir/firefox.pid.tmp.$$
+if printf '%s\n' "$PPID" >"$pid_tmp"; then
+    if ! mv -f "$pid_tmp" "$pid_file"; then
+        rm -f "$pid_tmp"
+        printf '%s\n' 'firefox-to-emacs-native-messenger-wrapper: pid-file rename failed' >&2
+    fi
+else
+    rm -f "$pid_tmp"
+    printf '%s\n' 'firefox-to-emacs-native-messenger-wrapper: pid-file write failed' >&2
+fi
+
+# Replace this process with socat, bridging stdio to the listener's
+# Unix-domain socket.  The -t flag is socat's half-close timeout (in
+# seconds): once one direction sees EOF, socat waits up to T seconds
+# for the other direction to finish before forcing both sides closed.
+# 86400 seconds (24h) is comfortably larger than any expected
+# long-running run subprocess, so the wrapper never prematurely
+# terminates an in-flight bridge round-trip.
+exec socat -t 86400 STDIO UNIX-CONNECT:"$socket_path"
