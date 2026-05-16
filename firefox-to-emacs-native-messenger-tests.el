@@ -7215,5 +7215,86 @@ directory."
          (set-file-modes cache original-mode)
          (firefox-to-emacs-native-messenger-stop))))))
 
+;;;; Phase 1000: Firefox native-messaging manifest at FILE-0400.
+;;;; The manifest is JSON, not Emacs Lisp; tests load it from disk
+;;;; and assert structural properties.  The TDD red stage before
+;;;; TASK-21100 manifests as a file-missing signal from
+;;;; insert-file-contents when tridactyl.json does not yet exist.
+
+(defconst firefox-to-emacs-native-messenger-test--manifest-path
+  (expand-file-name "tridactyl.json"
+                    firefox-to-emacs-native-messenger-test--project-root)
+  "Absolute path to the tridactyl.json manifest under test (FILE-0400).")
+
+(defun firefox-to-emacs-native-messenger-test--load-manifest ()
+  "Return the parsed contents of FILE-0400 (tridactyl.json) as an alist.
+
+Signals from insert-file-contents or json-parse-buffer propagate
+unchanged so a failing test reports the underlying cause."
+  (with-temp-buffer
+    (insert-file-contents
+     firefox-to-emacs-native-messenger-test--manifest-path)
+    (goto-char (point-min))
+    (json-parse-buffer :object-type 'alist :array-type 'list)))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-manifest-parses-as-json ()
+  "FILE-0400 must exist on disk and parse as a JSON object."
+  :tags '(:unit :fixture-driven)
+  (let ((manifest (firefox-to-emacs-native-messenger-test--load-manifest)))
+    (should (listp manifest))
+    (should (alist-get 'name manifest))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-manifest-name-field ()
+  "FILE-0400's name field must equal the string \"tridactyl\"."
+  :tags '(:unit :fixture-driven)
+  (should (equal "tridactyl"
+                 (alist-get
+                  'name
+                  (firefox-to-emacs-native-messenger-test--load-manifest)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-manifest-type-field ()
+  "FILE-0400's type field must equal the string \"stdio\"."
+  :tags '(:unit :fixture-driven)
+  (should (equal "stdio"
+                 (alist-get
+                  'type
+                  (firefox-to-emacs-native-messenger-test--load-manifest)))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-manifest-description-field ()
+  "FILE-0400's description field must be a non-empty string."
+  :tags '(:unit :fixture-driven)
+  (let ((desc (alist-get
+               'description
+               (firefox-to-emacs-native-messenger-test--load-manifest))))
+    (should (stringp desc))
+    (should (> (length desc) 0))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-manifest-path-field ()
+  "FILE-0400's path must be an absolute, tilde-resolved path ending
+in the wrapper filename.  Firefox does not expand a leading tilde
+when launching native hosts, so the path must already be resolved."
+  :tags '(:unit :fixture-driven)
+  (let ((path (alist-get
+               'path
+               (firefox-to-emacs-native-messenger-test--load-manifest))))
+    (should (stringp path))
+    (should (file-name-absolute-p path))
+    (should-not (string-prefix-p "~" path))
+    (should (string-suffix-p
+             "firefox-to-emacs-native-messenger-wrapper" path))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-manifest-allowed-extensions ()
+  "FILE-0400's allowed_extensions must list exactly the three upstream
+Tridactyl AMO IDs: stable, beta, and beta-no-newtab."
+  :tags '(:unit :fixture-driven)
+  (let ((ids (alist-get
+              'allowed_extensions
+              (firefox-to-emacs-native-messenger-test--load-manifest))))
+    (should (listp ids))
+    (should (= 3 (length ids)))
+    (should (member "tridactyl.vim@cmcaine.co.uk" ids))
+    (should (member "tridactyl.vim.betas@cmcaine.co.uk" ids))
+    (should (member "tridactyl.vim.betas.nonewtab@cmcaine.co.uk" ids))))
+
 (provide 'firefox-to-emacs-native-messenger-tests)
 ;;; firefox-to-emacs-native-messenger-tests.el ends here

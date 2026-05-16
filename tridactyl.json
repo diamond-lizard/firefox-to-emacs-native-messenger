@@ -1,0 +1,11 @@
+{
+    "name": "tridactyl",
+    "description": "Tridactyl native command handler implemented as an Emacs daemon bridge",
+    "path": "/home/cthulhu/bin/firefox-to-emacs-native-messenger-wrapper",
+    "type": "stdio",
+    "allowed_extensions": [
+        "tridactyl.vim@cmcaine.co.uk",
+        "tridactyl.vim.betas@cmcaine.co.uk",
+        "tridactyl.vim.betas.nonewtab@cmcaine.co.uk"
+    ]
+}
