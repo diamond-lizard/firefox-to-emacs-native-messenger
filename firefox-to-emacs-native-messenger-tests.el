@@ -7296,5 +7296,415 @@ Tridactyl AMO IDs: stable, beta, and beta-no-newtab."
     (should (member "tridactyl.vim.betas@cmcaine.co.uk" ids))
     (should (member "tridactyl.vim.betas.nonewtab@cmcaine.co.uk" ids))))
 
+;;;; ============================================================
+;;;; Phase 1250: `getconfig' handler and the extracted `--read-file-bounded'
+;;;; primitive (shared by `read' and `getconfig').
+;;;; ============================================================
+
+;;;; TASK-26500 / TASK-26600: tests for `--read-file-bounded' primitive.
+;;;; Contract: (PATH) -> (:ok CONTENT) | (:open-failure) | (:oversize).
+;;;; - Oversize is determined on RAW BYTES before decoding.
+;;;; - CONTENT on success is UTF-8 decoded from the raw bytes (matches
+;;;;   the existing `read' handler's decoding semantics).
+;;;; - Cap is sourced from
+;;;;   `firefox-to-emacs-native-messenger-outbound-response-cap';
+;;;;   the primitive reads up to (cap + 1) bytes via
+;;;;   `insert-file-contents-literally', so a raw read returning
+;;;;   exactly (cap + 1) bytes signals `:oversize'.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-file-bounded-empty-file ()
+  "0-byte file returns (:ok \"\") with present-empty string content."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+    (let ((path (expand-file-name "empty.txt" dir)))
+      (with-temp-file path (insert ""))
+      (should (equal (firefox-to-emacs-native-messenger--read-file-bounded path)
+                     '(:ok . ""))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-file-bounded-small-file ()
+  "Small UTF-8 file returns (:ok DECODED-CONTENT)."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+    (let ((path (expand-file-name "hello.txt" dir)))
+      (with-temp-file path (insert "hello world"))
+      (should (equal (firefox-to-emacs-native-messenger--read-file-bounded path)
+                     '(:ok . "hello world"))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-file-bounded-utf8-multibyte ()
+  "Multibyte UTF-8 content round-trips through decoding correctly."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+    (let ((path (expand-file-name "utf8.txt" dir)))
+      (with-temp-file path
+        (set-buffer-file-coding-system 'utf-8-unix)
+        (insert "café — naïve"))
+      (should (equal (firefox-to-emacs-native-messenger--read-file-bounded path)
+                     '(:ok . "café — naïve"))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-file-bounded-nonexistent ()
+  "Nonexistent path returns (:open-failure) without raising."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+    (let ((path (expand-file-name "definitely-not-here.txt" dir)))
+      (should (equal (firefox-to-emacs-native-messenger--read-file-bounded path)
+                     '(:open-failure))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-file-bounded-is-a-directory ()
+  "Directory path returns (:open-failure); using a directory avoids the
+chmod-permission-denied flakiness when the test process runs as root."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+    (let ((subdir (expand-file-name "subdir" dir)))
+      (make-directory subdir)
+      (should (equal (firefox-to-emacs-native-messenger--read-file-bounded subdir)
+                     '(:open-failure))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-file-bounded-cap-minus-one ()
+  "File of exactly (cap - 1) raw bytes returns (:ok CONTENT) (below cap)."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+    (let* ((cap firefox-to-emacs-native-messenger-outbound-response-cap)
+           (path (expand-file-name "below.txt" dir))
+           (content (make-string (1- cap) ?a)))
+      (with-temp-file path (insert content))
+      (let ((result (firefox-to-emacs-native-messenger--read-file-bounded path)))
+        (should (eq :ok (car result)))
+        (should (= (1- cap) (length (cdr result))))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-file-bounded-cap-exact ()
+  "File of exactly cap raw bytes returns (:ok CONTENT) (at cap, not over)."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+    (let* ((cap firefox-to-emacs-native-messenger-outbound-response-cap)
+           (path (expand-file-name "atcap.txt" dir))
+           (content (make-string cap ?a)))
+      (with-temp-file path (insert content))
+      (let ((result (firefox-to-emacs-native-messenger--read-file-bounded path)))
+        (should (eq :ok (car result)))
+        (should (= cap (length (cdr result))))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-file-bounded-cap-plus-one-oversize ()
+  "File of exactly (cap + 1) raw bytes returns (:oversize)."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+    (let* ((cap firefox-to-emacs-native-messenger-outbound-response-cap)
+           (path (expand-file-name "overcap.txt" dir))
+           (content (make-string (1+ cap) ?a)))
+      (with-temp-file path (insert content))
+      (should (equal (firefox-to-emacs-native-messenger--read-file-bounded path)
+                     '(:oversize))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-read-file-bounded-far-over-cap ()
+  "File well beyond cap still returns (:oversize) without reading the whole file."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+    (let* ((cap firefox-to-emacs-native-messenger-outbound-response-cap)
+           (path (expand-file-name "huge.txt" dir))
+           (content (make-string (* 4 cap) ?a)))
+      (with-temp-file path (insert content))
+      (should (equal (firefox-to-emacs-native-messenger--read-file-bounded path)
+                     '(:oversize))))))
+
+
+;;;; TASK-26900 / TASK-27000: `getconfig' success-fixture tests.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-getconfig-success-fixture ()
+  "Successful `getconfig' matches the PROTOCOL.md `getconfig-success' fixture.
+
+Override the rcpath-candidates defconst with a sandbox-tempdir-based
+list so production paths (e.g., `~/.config/tridactyl/tridactylrc') are
+never touched and the test does not depend on user environment."
+  :tags '(:unit :sandbox :fixture-driven)
+  (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+    (let* ((rc-path (expand-file-name "tridactylrc" dir))
+           (firefox-to-emacs-native-messenger-rcpath-candidates
+            (list rc-path)))
+      (with-temp-file rc-path (insert "set hintchars asdfg"))
+      (let* ((fixture
+              (firefox-to-emacs-native-messenger-test-load-fixture
+               "getconfig-success"))
+             (expected-response (alist-get 'response fixture))
+             (actual-response
+              (firefox-to-emacs-native-messenger--getconfig-handler
+               nil '((cmd . "getconfig")))))
+        (should (firefox-to-emacs-native-messenger-test-fixture-equal-p
+                 expected-response actual-response))
+        (should (equal "set hintchars asdfg"
+                       (alist-get 'content actual-response)))
+        (should (= 0 (alist-get 'code actual-response)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-getconfig-cmd-field-is-getconfig ()
+  "Response `cmd' is `\"getconfig\"', NOT `\"read\"' or `\"error\"'."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+    (let* ((rc-path (expand-file-name "tridactylrc" dir))
+           (firefox-to-emacs-native-messenger-rcpath-candidates
+            (list rc-path)))
+      (with-temp-file rc-path (insert "x"))
+      (let ((response (firefox-to-emacs-native-messenger--getconfig-handler
+                       nil '((cmd . "getconfig")))))
+        (should (equal "getconfig" (alist-get 'cmd response)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-getconfig-ignores-extra-request-fields ()
+  "Per Section 8.24.10 of the implementation plan, `getconfig' reads
+only `cmd' and silently ignores extra request fields."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+    (let* ((rc-path (expand-file-name "tridactylrc" dir))
+           (firefox-to-emacs-native-messenger-rcpath-candidates
+            (list rc-path)))
+      (with-temp-file rc-path (insert "y"))
+      (let ((response (firefox-to-emacs-native-messenger--getconfig-handler
+                       nil '((cmd . "getconfig")
+                             (file . "/should/be/ignored")
+                             (content . "ignored")
+                             (junk . 42)))))
+        (should (equal "getconfig" (alist-get 'cmd response)))
+        (should (= 0 (alist-get 'code response)))
+        (should (equal "y" (alist-get 'content response)))))))
+
+;;;; TASK-27200: `getconfig' no-candidate fixture test.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-getconfig-no-candidate-fixture ()
+  "With no rc candidate present, returns ((cmd . \"getconfig\") (code . 1))
+with no `content' field, matching the `getconfig-empty' fixture."
+  :tags '(:unit :sandbox :fixture-driven)
+  (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+    (let ((firefox-to-emacs-native-messenger-rcpath-candidates
+           (list (expand-file-name "missing-a.rc" dir)
+                 (expand-file-name "missing-b.rc" dir))))
+      (let* ((fixture
+              (firefox-to-emacs-native-messenger-test-load-fixture
+               "getconfig-empty"))
+             (expected-response (alist-get 'response fixture))
+             (actual-response
+              (firefox-to-emacs-native-messenger--getconfig-handler
+               nil '((cmd . "getconfig")))))
+        (should (firefox-to-emacs-native-messenger-test-fixture-equal-p
+                 expected-response actual-response))
+        (should (equal "getconfig" (alist-get 'cmd actual-response)))
+        (should (= 1 (alist-get 'code actual-response)))
+        (should-not (assq 'content actual-response))))))
+
+;;;; TASK-27400: `getconfig' ungated behavior test.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-getconfig-ungated ()
+  "`getconfig' succeeds regardless of whitelist defcustom values
+per REQ-4800; binding both whitelists to nil does not block the handler."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+    (firefox-to-emacs-native-messenger-test--with-saved-whitelists
+     (let* ((rc-path (expand-file-name "tridactylrc" dir))
+            (firefox-to-emacs-native-messenger-rcpath-candidates
+             (list rc-path)))
+       (with-temp-file rc-path (insert "ungated content"))
+       (setq firefox-to-emacs-native-messenger-run-whitelist nil)
+       (setq firefox-to-emacs-native-messenger-read-whitelist nil)
+       (let ((response (firefox-to-emacs-native-messenger--getconfig-handler
+                        nil '((cmd . "getconfig")))))
+         (should (equal "getconfig" (alist-get 'cmd response)))
+         (should (= 0 (alist-get 'code response)))
+         (should (equal "ungated content"
+                        (alist-get 'content response))))))))
+
+;;;; TASK-27600: `getconfig' oversize-fixture test.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-getconfig-oversize-fixture ()
+  "An rc candidate exceeding the outbound-response-cap produces the
+generic-error oversize shape per fixture `getconfig-oversize'."
+  :tags '(:integration :sandbox :fixture-driven)
+  (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+    (let* ((cap firefox-to-emacs-native-messenger-outbound-response-cap)
+           (rc-path (expand-file-name "huge.rc" dir))
+           (firefox-to-emacs-native-messenger-rcpath-candidates
+            (list rc-path)))
+      (with-temp-file rc-path
+        (insert (make-string (1+ cap) ?a)))
+      (let* ((fixture
+              (firefox-to-emacs-native-messenger-test-load-fixture
+               "getconfig-oversize"))
+             (expected-response (alist-get 'response fixture))
+             (actual-response
+              (firefox-to-emacs-native-messenger--getconfig-handler
+               nil '((cmd . "getconfig")))))
+        (should (firefox-to-emacs-native-messenger-test-fixture-equal-p
+                 expected-response actual-response))
+        (should (equal "error" (alist-get 'cmd actual-response)))
+        (should (equal "file too large to return"
+                       (alist-get 'error actual-response)))))))
+
+;;;; TASK-27800: `getconfig' empty-rc-file (0-byte) fixture test.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-getconfig-empty-rc-file-fixture ()
+  "A 0-byte rc candidate produces the present-and-empty `content' shape
+per fixture `getconfig-empty-rc-file' (distinct from no-candidate)."
+  :tags '(:unit :sandbox :fixture-driven)
+  (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+    (let* ((rc-path (expand-file-name "empty.rc" dir))
+           (firefox-to-emacs-native-messenger-rcpath-candidates
+            (list rc-path)))
+      (with-temp-file rc-path (insert ""))
+      (let* ((fixture
+              (firefox-to-emacs-native-messenger-test-load-fixture
+               "getconfig-empty-rc-file"))
+             (expected-response (alist-get 'response fixture))
+             (actual-response
+              (firefox-to-emacs-native-messenger--getconfig-handler
+               nil '((cmd . "getconfig")))))
+        (should (firefox-to-emacs-native-messenger-test-fixture-equal-p
+                 expected-response actual-response))
+        (should (equal "getconfig" (alist-get 'cmd actual-response)))
+        (should (= 0 (alist-get 'code actual-response)))
+        (should (equal "" (alist-get 'content actual-response)))
+        (should (assq 'content actual-response))))))
+
+;;;; TASK-28000: `getconfig' foreign-UID (IOError) test.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-getconfig-foreign-uid-fixture ()
+  "A candidate whose file-UID differs from the daemon's UID produces
+the IOError shape per Section 8.24.4 / REQ-4800 (code 2, no content).
+
+We mock `file-attributes' (rather than `file-attribute-user-id', which
+the byte-compiler may inline) so the production code sees a fake attrs
+list whose third element (the UID) is `foreign-uid'."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+    (let* ((rc-path (expand-file-name "tridactylrc" dir))
+           (firefox-to-emacs-native-messenger-rcpath-candidates
+            (list rc-path))
+           (foreign-uid (+ 1 (user-uid)))
+           (real-file-attributes (symbol-function 'file-attributes)))
+      (with-temp-file rc-path (insert "secret"))
+      (cl-letf (((symbol-function 'file-attributes)
+                 (lambda (path &optional id-format)
+                   (let ((attrs (funcall real-file-attributes path id-format)))
+                     (if (and attrs (string= path rc-path))
+                         (let ((copy (copy-sequence attrs)))
+                           (setf (nth 2 copy) foreign-uid)
+                           copy)
+                       attrs)))))
+        (let* ((fixture
+                (firefox-to-emacs-native-messenger-test-load-fixture
+                 "getconfig-open-failure"))
+               (expected-response (alist-get 'response fixture))
+               (actual-response
+                (firefox-to-emacs-native-messenger--getconfig-handler
+                 nil '((cmd . "getconfig")))))
+          (should (firefox-to-emacs-native-messenger-test-fixture-equal-p
+                   expected-response actual-response))
+          (should (equal "getconfig" (alist-get 'cmd actual-response)))
+          (should (= 2 (alist-get 'code actual-response)))
+          (should-not (assq 'content actual-response)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-getconfig-foreign-uid-content-not-disclosed ()
+  "Foreign-UID check runs BEFORE the read; the rc bytes are NOT in the
+response.  Mocks `file-attributes' so the byte-compiler's inlining of
+`file-attribute-user-id' does not bypass the UID-mock."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+    (let* ((rc-path (expand-file-name "tridactylrc" dir))
+           (firefox-to-emacs-native-messenger-rcpath-candidates
+            (list rc-path))
+           (foreign-uid (+ 1 (user-uid)))
+           (secret "uniquesentinelxyz")
+           (real-file-attributes (symbol-function 'file-attributes)))
+      (with-temp-file rc-path (insert secret))
+      (cl-letf (((symbol-function 'file-attributes)
+                 (lambda (path &optional id-format)
+                   (let ((attrs (funcall real-file-attributes path id-format)))
+                     (if (and attrs (string= path rc-path))
+                         (let ((copy (copy-sequence attrs)))
+                           (setf (nth 2 copy) foreign-uid)
+                           copy)
+                       attrs)))))
+        (let ((response (firefox-to-emacs-native-messenger--getconfig-handler
+                         nil '((cmd . "getconfig")))))
+          (should-not (alist-get 'content response))
+          ;; And the secret string must NOT appear anywhere in the
+          ;; response's other fields (defensive).
+          (dolist (cell response)
+            (when (stringp (cdr cell))
+              (should-not (string-match-p secret (cdr cell))))))))))
+
+;;;; TASK-28200: `getconfig' does-not-register test.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-getconfig-does-not-register ()
+  "The rc path returned by `getconfig' is NOT entered into the
+capability registry per REQ-4800 / Section 8.24.9."
+  :tags '(:unit :sandbox)
+  (firefox-to-emacs-native-messenger-test--with-fresh-registry
+   (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+     (let* ((rc-path (expand-file-name "tridactylrc" dir))
+            (firefox-to-emacs-native-messenger-rcpath-candidates
+             (list rc-path)))
+       (with-temp-file rc-path (insert "x"))
+       (firefox-to-emacs-native-messenger--getconfig-handler
+        nil '((cmd . "getconfig")))
+       (should-not (firefox-to-emacs-native-messenger--registry-contains-p
+                    rc-path))
+       (should (= 0 (hash-table-count
+                     firefox-to-emacs-native-messenger--capability-registry)))))))
+
+;;;; TASK-28400: dispatcher round-trip test.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-dispatcher-routes-getconfig ()
+  "The dispatcher routes `getconfig' to the new handler (not the
+\"Unhandled message\" fallback); response `cmd' is `\"getconfig\"'."
+  :tags '(:integration :sandbox)
+  (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+    (let* ((rc-path (expand-file-name "tridactylrc" dir))
+           (firefox-to-emacs-native-messenger-rcpath-candidates
+            (list rc-path)))
+      (with-temp-file rc-path (insert "dispatched"))
+      (let ((response (firefox-to-emacs-native-messenger--dispatch-request
+                       nil '((cmd . "getconfig")))))
+        (should (equal "getconfig" (alist-get 'cmd response)))
+        (should (= 0 (alist-get 'code response)))
+        (should (equal "dispatched" (alist-get 'content response)))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-dispatcher-getconfig-registered ()
+  "`getconfig' is registered as a function in the dispatcher's handler table."
+  :tags '(:unit)
+  (should (functionp (gethash "getconfig"
+                              firefox-to-emacs-native-messenger--handlers))))
+
+;;;; Through-the-build-response pipeline test (per rubber-duck suggestion).
+;;;; Confirms absent-vs-empty distinction survives the response builder.
+
+(ert-deftest firefox-to-emacs-native-messenger-test-getconfig-no-candidate-through-build ()
+  "no-candidate handler output, after `--build-response', strips no content
+field (it was never present); the wire shape matches the fixture exactly."
+  :tags '(:unit :sandbox :fixture-driven)
+  (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+    (let ((firefox-to-emacs-native-messenger-rcpath-candidates
+           (list (expand-file-name "absent.rc" dir))))
+      (let* ((handler-output
+              (firefox-to-emacs-native-messenger--getconfig-handler
+               nil '((cmd . "getconfig"))))
+             (built
+              (firefox-to-emacs-native-messenger--build-response handler-output))
+             (fixture (firefox-to-emacs-native-messenger-test-load-fixture
+                       "getconfig-empty"))
+             (expected (alist-get 'response fixture)))
+        (should (firefox-to-emacs-native-messenger-test-fixture-equal-p
+                 expected built))))))
+
+(ert-deftest firefox-to-emacs-native-messenger-test-getconfig-empty-rc-through-build ()
+  "Empty-rc-file handler output, after `--build-response', preserves the
+present-empty `content' field (distinct from absent)."
+  :tags '(:unit :sandbox :fixture-driven)
+  (firefox-to-emacs-native-messenger-test-with-sandbox-tempdir dir
+    (let* ((rc-path (expand-file-name "empty.rc" dir))
+           (firefox-to-emacs-native-messenger-rcpath-candidates
+            (list rc-path)))
+      (with-temp-file rc-path (insert ""))
+      (let* ((handler-output
+              (firefox-to-emacs-native-messenger--getconfig-handler
+               nil '((cmd . "getconfig"))))
+             (built
+              (firefox-to-emacs-native-messenger--build-response handler-output)))
+        (should (assq 'content built))
+        (should (equal "" (alist-get 'content built)))))))
+
 (provide 'firefox-to-emacs-native-messenger-tests)
 ;;; firefox-to-emacs-native-messenger-tests.el ends here

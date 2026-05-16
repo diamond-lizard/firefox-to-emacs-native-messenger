@@ -9,8 +9,9 @@
 ;; A pure Emacs-Lisp bridge implementing the Firefox WebExtensions native
 ;; messaging protocol as consumed by the Tridactyl browser extension.
 ;; The bridge accepts length-prefixed JSON frames over a Unix-domain socket
-;; and dispatches the five in-scope handlers `version', `getconfigpath',
-;; `temp', `read', and `run' with per-handler default-deny access control.
+;; and dispatches the six in-scope handlers `version', `getconfigpath',
+;; `getconfig', `temp', `read', and `run' with per-handler default-deny
+;; access control.
 ;;
 ;; See PROTOCOL.md for the wire-contract specification and per-handler
 ;; request/response shapes; see README.md for installation, operations,
@@ -156,7 +157,7 @@ Verified to exist at mode 0700 on every listener start.")
   "Version string claimed by the bridge in `version' handler responses.
 
 Pinned to the lowest upstream `native_main.nim' VERSION whose request
-and response contract is fully implemented for the five v2 handlers in
+and response contract is fully implemented for the six v2 handlers in
 scope, constrained to be at least the upstream
 `requiredNativeMessengerVersion' that gates `Native.getrcpath' per
 Tridactyl `src/lib/native.ts'.  See PROTOCOL.md Section 8 for the
@@ -1901,8 +1902,8 @@ order (per PROTOCOL.md Section 17).  For each candidate:
      symlink, or other non-regular file).
 
 Returns nil if no candidate qualifies.  The `getconfigpath' handler
-(and any future `getconfig' implementation) consumes this walker to
-implement the upstream-compatible first-existing-candidate semantics."
+and the v2.2 `getconfig' handler (Phase 1250) both consume this
+walker to implement the upstream-compatible first-existing-candidate semantics."
   (cl-block found
     (dolist (candidate firefox-to-emacs-native-messenger-rcpath-candidates)
       (firefox-to-emacs-native-messenger--tramp-guard candidate)
@@ -2003,14 +2004,40 @@ signals into the fixture-defined error wordings."
         (format "whitelist malformed: %s"
                 (error-message-string err))))))
 
-(defun firefox-to-emacs-native-messenger--read-handler--read-file (path)
-  "Bounded-read PATH and return the wire response.
 
-Reads up to (outbound-cap + 1) bytes via
-`insert-file-contents-literally' into a unibyte buffer; a fill-to-cap+1
-read produces the `file too large to return' generic error; open
-failure produces the upstream `read' open-failure shape (`content =
-\"\"', `code = 2')."
+(defun firefox-to-emacs-native-messenger--read-file-bounded (path)
+  "Bounded raw read of PATH; return a discriminated status value.
+
+Reads up to (outbound-cap + 1) bytes from PATH into a unibyte buffer
+via `insert-file-contents-literally', where outbound-cap is
+`firefox-to-emacs-native-messenger-outbound-response-cap'.  The
+return value is one of three forms; the caller maps each form to its
+handler-specific wire shape:
+
+  - `(:ok . CONTENT)' — the file was read successfully and its raw
+    bytes are at most outbound-cap.  CONTENT is the UTF-8-decoded
+    string of the raw bytes (matching the existing `read' handler's
+    decoding semantics; binary fidelity is preserved in memory but
+    the wire is UTF-8-bound).  CONTENT may be the empty string when
+    PATH is a 0-byte file; that case is structurally distinct from
+    `(:open-failure)' (see below).
+  - `(:open-failure)' — `insert-file-contents-literally' signaled
+    `file-error', meaning PATH does not exist, is a directory, has
+    permission denied, or hit some other OS-level open error.  No
+    bytes were read.
+  - `(:oversize)' — the file's raw byte length is at least
+    (outbound-cap + 1).  The raw-byte cap is enforced BEFORE
+    decoding so the writer's outbound check does not need to handle
+    arbitrary-size content.  Note that a near-cap raw file may still
+    trigger the writer-level oversized-response replacement after
+    JSON serialization adds escape overhead; this primitive's cap is
+    a raw-file cap, not a serialized-response cap.
+
+This primitive is consumed by both the `read' handler and the
+v2.2-added `getconfig' handler (Phase 1250) so the bounded-read
+behavior is identical across both call sites.  Cap is sourced from
+the defcustom rather than parameterized so live `customize-set-variable'
+edits to the cap take immediate effect on the next call."
   (let* ((outbound-cap
            firefox-to-emacs-native-messenger-outbound-response-cap)
          (read-cap (1+ outbound-cap)))
@@ -2020,18 +2047,168 @@ failure produces the upstream `read' open-failure shape (`content =
           (insert-file-contents-literally path nil 0 read-cap)
           (let ((bytes-read (buffer-size)))
             (cond
-              ((>= bytes-read read-cap)
-                (firefox-to-emacs-native-messenger--build-error-response
-                  "file too large to return"))
-              (t
-                (list (cons 'cmd "read")
-                      (cons 'content
-                            (decode-coding-string (buffer-string) 'utf-8))
-                      (cons 'code 0))))))
-      (file-error
+              ((>= bytes-read read-cap) '(:oversize))
+              (t (cons :ok
+                       (decode-coding-string (buffer-string) 'utf-8))))))
+      (file-error '(:open-failure)))))
+
+(defun firefox-to-emacs-native-messenger--read-handler--read-file (path)
+  "Bounded-read PATH and return the `read'-handler wire response.
+
+Delegates the raw bounded-read to
+`firefox-to-emacs-native-messenger--read-file-bounded' (Phase 1250)
+and maps its discriminated status value to the `read'-specific wire
+shapes:
+
+  - `(:ok . CONTENT)' -> upstream success shape
+    `((cmd . \"read\") (content . CONTENT) (code . 0))'.
+  - `(:open-failure)' -> upstream open-failure shape
+    `((cmd . \"read\") (content . \"\") (code . 2))' per
+    PROTOCOL.md Section 5.  This shape is STRUCTURALLY DISTINCT
+    from the generic error response (cmd remains `\"read\"';
+    `content' is a present-empty string).
+  - `(:oversize)' -> generic-error wire shape
+    `((cmd . \"error\") (error . \"file too large to return\"))'
+    per PROTOCOL.md Section 11.
+
+The bounded-read primitive is shared with the `getconfig' handler
+so behavior is identical across both call sites; the per-handler
+wire-shape mapping is the only thing that differs."
+  (let ((result (firefox-to-emacs-native-messenger--read-file-bounded path)))
+    (cond
+      ((eq :ok (car result))
+        (list (cons 'cmd "read")
+              (cons 'content (cdr result))
+              (cons 'code 0)))
+      ((eq :open-failure (car result))
         (list (cons 'cmd "read")
               (cons 'content "")
-              (cons 'code 2))))))
+              (cons 'code 2)))
+      ((eq :oversize (car result))
+        (firefox-to-emacs-native-messenger--build-error-response
+          "file too large to return")))))
+
+
+;;;; ============================================================
+;;;; Phase 1250: `getconfig' handler.
+;;;; ============================================================
+;;;; v2.2 addition.  Returns the contents of the first existing rc
+;;;; candidate so Tridactyl's `:source' excmd and the
+;;;; `TriStart' -> `source_quiet' startup auto-source path work.
+;;;; Composition: the existing `--find-rcpath' walker plus a
+;;;; file-UID equality check (REQ-4800 / Section 8.24.9) plus the
+;;;; extracted `--read-file-bounded' primitive.  The handler is
+;;;; UNGATED; its security boundary is the UID equality check.
+
+(defun firefox-to-emacs-native-messenger--getconfig-handler
+    (_client _request)
+  "Return the upstream-compatible `getconfig' response (v2.2 / Phase 1250).
+
+Composition per Section 8.24.7-8.24.9 of the implementation plan and
+the contract in PROTOCOL.md Sections 3.2.7-3.2.11:
+
+  1. Invoke `firefox-to-emacs-native-messenger--find-rcpath' to locate
+     the first existing rc candidate.  On nil (no candidate exists),
+     return the upstream no-candidate shape
+     `((cmd . \"getconfig\") (code . 1))' matching the
+     `getconfig-empty' fixture (no `content' field).
+
+  2. On a hit PATH, fetch `(file-attributes PATH)' defensively
+     wrapped in `condition-case' for `file-error'.  If the call
+     signals `file-error' OR returns nil (race between
+     `--find-rcpath' confirming existence and the attribute fetch),
+     return the IOError shape `((cmd . \"getconfig\") (code . 2))'
+     (no `content' field) matching the `getconfig-open-failure'
+     fixture.
+
+  3. Compare `(file-attribute-user-id attrs)' against `(user-uid)'.
+     On mismatch (foreign UID; e.g., a root-created file under the
+     user's home or a file written by another user via a permissive
+     parent directory), return the IOError shape per REQ-4800.  The
+     UID check makes the \"user-owned configuration\" claim true
+     before disclosing the file's contents.  TOCTTOU note per
+     Section 8.24.9: the check is a single check immediately before
+     reading; the residual TOCTTOU window is accepted because an
+     attacker with write/rename access to the candidate path
+     already controls Tridactyl startup configuration.
+
+  4. On UID equality, invoke
+     `firefox-to-emacs-native-messenger--read-file-bounded' on the
+     path and map its discriminated status value to `getconfig'
+     wire shapes:
+
+       - `(:ok . CONTENT)' -> upstream success shape
+         `((cmd . \"getconfig\") (content . CONTENT) (code . 0))'
+         matching the `getconfig-success' fixture.  When the file
+         is exactly 0 bytes, CONTENT is the empty string and the
+         response matches `getconfig-empty-rc-file' (present-and-
+         empty `content', structurally distinct from
+         `getconfig-empty').
+
+       - `(:open-failure)' -> IOError shape per upstream
+         `readFile' failure (file was deleted or unreadable
+         between attribute fetch and bounded-read).
+
+       - `(:oversize)' -> generic-error shape
+         `((cmd . \"error\") (error . \"file too large to return\"))'
+         matching the `getconfig-oversize' fixture (same wording
+         as the `read'-handler oversize response).
+
+The path is NOT registered in the capability registry per REQ-4800
+/ Section 8.24.9.  The registry is reserved for paths the bridge
+CREATED via `temp'; users who want subsequent `read' access to the
+same path through the bridge add the path (or a glob covering it)
+to `firefox-to-emacs-native-messenger-read-whitelist' via the
+existing first-class mechanism.
+
+Per Section 8.24.1 / 8.24.10, the handler reads ONLY the `cmd'
+field of the request; extra fields are silently ignored and not
+echoed in the response.  Both CLIENT and REQUEST are accepted for
+dispatch-table uniformity and not consulted."
+  (let ((path (firefox-to-emacs-native-messenger--find-rcpath)))
+    (cond
+      ((null path)
+        (list (cons 'cmd "getconfig") (cons 'code 1)))
+      (t
+        (firefox-to-emacs-native-messenger--getconfig-handler--with-path
+          path)))))
+
+(defun firefox-to-emacs-native-messenger--getconfig-handler--with-path
+    (path)
+  "Run the UID check + bounded-read sequence for `getconfig' on PATH.
+
+Helper for `--getconfig-handler' that runs once `--find-rcpath' has
+returned a non-nil candidate.  Splitting the body keeps each
+function below the project's complexity ceiling and isolates the
+UID-disclosure-gate concern from the candidate-walker concern."
+  (let ((attrs (condition-case _err
+                   (file-attributes path)
+                 (file-error nil))))
+    (cond
+      ((null attrs)
+        (list (cons 'cmd "getconfig") (cons 'code 2)))
+      ((not (eql (file-attribute-user-id attrs) (user-uid)))
+        (list (cons 'cmd "getconfig") (cons 'code 2)))
+      (t
+        (firefox-to-emacs-native-messenger--getconfig-handler--read-uid-ok
+          path)))))
+
+(defun firefox-to-emacs-native-messenger--getconfig-handler--read-uid-ok
+    (path)
+  "Run `--read-file-bounded' on PATH and map the result to the
+`getconfig' wire shape.  Called only after the file-UID equality
+check has confirmed the candidate is daemon-UID-owned."
+  (let ((result (firefox-to-emacs-native-messenger--read-file-bounded path)))
+    (cond
+      ((eq :ok (car result))
+        (list (cons 'cmd "getconfig")
+              (cons 'content (cdr result))
+              (cons 'code 0)))
+      ((eq :open-failure (car result))
+        (list (cons 'cmd "getconfig") (cons 'code 2)))
+      ((eq :oversize (car result))
+        (firefox-to-emacs-native-messenger--build-error-response
+          "file too large to return")))))
 
 
 ;;;; ============================================================
@@ -2627,16 +2804,21 @@ because the connection state has already moved to `dispatched'."
         'info "run stdin send error on %S: %S" proc err)))
     (list (cons 'cmd "run-deferred"))))
 
-;;;; Register the five v2 handlers in the dispatcher table.
-;;;; Per REQ-1600, only these five cmds are implemented; every other
-;;;; cmd falls through to "Unhandled message".  Phase 0800 adds
-;;;; `run' (the async / deferred-response handler).
+;;;; Register the six v2 handlers in the dispatcher table.
+;;;; Per REQ-1600 (v2.2), the implemented cmds are `version',
+;;;; `getconfigpath', `getconfig', `temp', `read', `run'.  Every
+;;;; other cmd falls through to "Unhandled message".  Phase 0800
+;;;; adds `run' (the async / deferred-response handler); Phase 1250
+;;;; adds `getconfig' (the v2.2 ungated rc-content handler).
 
 (puthash "version"
          #'firefox-to-emacs-native-messenger--version-handler
          firefox-to-emacs-native-messenger--handlers)
 (puthash "getconfigpath"
          #'firefox-to-emacs-native-messenger--getconfigpath-handler
+         firefox-to-emacs-native-messenger--handlers)
+(puthash "getconfig"
+         #'firefox-to-emacs-native-messenger--getconfig-handler
          firefox-to-emacs-native-messenger--handlers)
 (puthash "temp"
          #'firefox-to-emacs-native-messenger--temp-handler

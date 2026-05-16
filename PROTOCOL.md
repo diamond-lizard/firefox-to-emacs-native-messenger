@@ -2,7 +2,7 @@
 
 This document is the single authoritative specification of the per-command request and response contract implemented by the v2 firefox-to-emacs-native-messenger bridge; no other document overrides it on per-command shapes.
 
-The v2 bridge implements EXACTLY five handlers from upstream Tridactyl's native-messaging protocol: `version`, `getconfigpath`, `temp`, `read`, `run`. All other commands fall through to the dispatcher's generic error response (`cmd = "error"`, `error = "Unhandled message"`). The wire protocol itself (4-byte little-endian length prefix + UTF-8 JSON) is unchanged from Mozilla's WebExtensions native-messaging specification.
+The v2 bridge implements EXACTLY SIX handlers from upstream Tridactyl's native-messaging protocol (v2.2): `version`, `getconfigpath`, `getconfig`, `temp`, `read`, `run`. All other commands fall through to the dispatcher's generic error response (`cmd = "error"`, `error = "Unhandled message"`). The wire protocol itself (4-byte little-endian length prefix + UTF-8 JSON) is unchanged from Mozilla's WebExtensions native-messaging specification.
 
 Sources audited at the time of writing:
 
@@ -19,10 +19,10 @@ Every cmd that Tridactyl's `src/lib/native.ts` is capable of issuing, cross-refe
 |---|---|---|
 | `version` | yes | Returns VERSION string + `code=0`. JS wrapper: `getNativeMessengerVersion()`. |
 | `getconfigpath` | yes | Returns first existing candidate config path in the `content` field. JS wrapper: `getrcpath()`. |
+| `getconfig` | yes | Returns file contents of the first existing rc candidate (same walker as `getconfigpath`) with `content` + `code=0`; empty-result is `code=1` (no `content` field); IOError-or-foreign-UID is `code=2` per Section 8.24.4 of the implementation plan; oversize is the generic-error shape. JS wrapper: `getrc()`. v2.2 added; supports Tridactyl `:source` and `TriStart -> source_quiet` startup auto-source. |
 | `temp` | yes | Writes content to a tempfile under the dedicated tempfile directory; returns path in `content`. |
 | `read` | yes | Reads file content with bounded size cap. |
 | `run` | yes | Synchronous shell-out; returns merged stdout+stderr + exit code. |
-| `getconfig` | no | Falls through to "Unhandled message". Breaks Tridactyl's `:source` excmd. |
 | `write` | no | Falls through. |
 | `writerc` | no | Falls through. |
 | `mkdir` | no | Falls through. |
@@ -98,6 +98,19 @@ All inbound JSON objects MUST include a `cmd` field whose value selects the hand
 - Null vs absence (`command`): both treated as missing-required-field; v2 returns the generic error response.
 - JS wrapper: `Native.run(command, content = "")` calls `sendNativeMsg("run", {command, content})` (`src/lib/native.ts:558`). The wrapper ALWAYS sends a `content` field, defaulting to empty string `""`. In practice v2 will therefore typically observe `content = ""` from Tridactyl (not absent), which is treated identically to "no stdin sent" since empty-string stdin writes zero bytes before EOF.
 
+### 2.6 `getconfig` Request
+
+```json
+{ "cmd": "getconfig" }
+```
+
+- Required: `cmd` (string, value `"getconfig"`).
+- Optional: none.
+- Null vs absence: irrelevant; no other fields are inspected.
+- Extra fields (e.g., `file`, `content`, anything else) are SILENTLY IGNORED. The handler MUST NOT echo them in the response and MUST NOT raise an error.
+- JS wrapper: `Native.getrc()` calls `sendNativeMsg("getconfig", {})` (`src/lib/native.ts`; corresponds to upstream's only consumer site for this cmd). v2.2 added; Tridactyl's `:source` excmd and the `TriStart -> source_quiet` startup auto-source path consume the response.
+- Audit cite: upstream `native_main.nim:140` case statement; `getconfig` branch at lines 145-154 reads only `cmd`.
+
 ## 3. Response Field Membership and Presence Rules
 
 This section enumerates which fields can appear in each response and when each field is present, conditionally present, or always omitted.
@@ -116,7 +129,7 @@ Upstream `native_main.nim` defines a single `MessageResp` record with the follow
 | `command` | optional string | yes (`run` only) |
 | `files` | string sequence | NO (`list_dir` only) |
 | `isDir` | boolean | NO (`list_dir` only) |
-| `code` | optional integer | yes (all five handlers in success cases) |
+| `code` | optional integer | yes (all six handlers in success cases) |
 
 For the five in-scope handlers, the only response fields that ever appear are: `cmd`, `version`, `content`, `command`, `code`, and (only in error responses) `error`.
 
@@ -192,26 +205,82 @@ Audit cite: `native_main.nim:155-160`. The empty-result branch sets only `code =
 - `code`: ALWAYS present; integer exit status from `waitForExit`. May be 0 (normal-zero), positive (normal-nonzero), or signal-derived (typically 128 + signum on POSIX shells via `/bin/sh -c`).
 - v2 additional terminal causes (overflow / timeout / connection-loss) are NOT modeled as upstream response shapes; see Section 7 for the v2-specific error responses.
 
+#### 3.2.7 `getconfig` success (rc candidate found, non-empty content)
+
+```json
+{ "cmd": "getconfig", "content": "<verbatim rc file contents>", "code": 0 }
+```
+
+- `cmd`: always present.
+- `content`: present in this case; the verbatim bytes of the first existing rc candidate, decoded as UTF-8 (matching v2's existing `read`-handler decoding semantics).
+- `code`: always present, always `0`.
+- All other fields: always omitted.
+- Audit cite: upstream `native_main.nim:151-152`.
+
+#### 3.2.8 `getconfig` empty-rc-file (rc candidate found, file is 0 bytes)
+
+```json
+{ "cmd": "getconfig", "content": "", "code": 0 }
+```
+
+- `cmd`: always present.
+- `content`: PRESENT-AND-EMPTY (explicitly set to the empty string; not absent). Upstream's `readFile` returns an empty string for a 0-byte file; `toJson` at lines 43-45 emits empty strings via `%value.get`.
+- `code`: always present, always `0`.
+- This shape is STRUCTURALLY DISTINCT from 3.2.9 (no-candidate), which omits `content` entirely. Consumers MUST distinguish absent-vs-empty per Section 6.
+
+#### 3.2.9 `getconfig` no-candidate (no existing rc on disk)
+
+```json
+{ "cmd": "getconfig", "code": 1 }
+```
+
+- `cmd`: always present.
+- `content`: ABSENT (upstream's `result.content` stays as `none(string)` because the no-candidate branch never assigns it; `toJson` then omits the field).
+- `code`: always present, value `1` (per upstream's "recoverable failure" convention).
+- Audit cite: `native_main.nim:148-149`.
+
+#### 3.2.10 `getconfig` IOError-on-read or foreign-UID
+
+```json
+{ "cmd": "getconfig", "code": 2 }
+```
+
+- `cmd`: always present.
+- `content`: ABSENT.
+- `code`: always present, value `2` (per upstream's "I/O failure" convention).
+- Upstream fires this when `fileExists` returned true but `readFile` then failed (permission denied, race, etc.). Audit cite: `native_main.nim:153-154`.
+- v2.2 ALSO fires this when the candidate exists but its file-UID differs from the daemon's UID per REQ-4800 / Section 8.24.9 of the implementation plan. The UID check makes the "user-owned configuration" claim true before disclosing the file's contents to the requesting extension.
+
+#### 3.2.11 `getconfig` oversize (rc file exceeds outbound response cap)
+
+The oversize case has NO upstream equivalent (upstream has no cap). v2.2 returns the GENERIC ERROR shape (Section 7):
+
+```json
+{ "cmd": "error", "error": "file too large to return" }
+```
+
+This matches the existing `read`-handler oversize response shape; the bounded-read primitive (shared between `read` and `getconfig`) returns the `:oversize` status which the handler maps to this generic error.
+
 ### 3.3 Field Presence Summary Table
 
 For each `(cmd, field)` pair in the success case:
 
-| field \ cmd | `version` | `getconfigpath` (found) | `getconfigpath` (empty) | `temp` | `read` | `run` |
-|---|---|---|---|---|---|---|
-| `cmd` | always | always | always | always | always | always |
-| `version` | always | omitted | omitted | omitted | omitted | omitted |
-| `content` | omitted | present (path) | omitted | present (path) | present (file bytes) | present (output) |
-| `command` | omitted | omitted | omitted | omitted | omitted | present (echo) |
-| `code` | always `0` | always `0` | always `1` | always `0` (in success; `2` on I/O failure upstream / generic error in v2) | always `0` (in success; open-failure shape in Section 5) | always (exit status) |
-| `error` | omitted | omitted | omitted | omitted | omitted | omitted |
+| field \ cmd | `version` | `getconfigpath` (found) | `getconfigpath` (empty) | `getconfig` (found) | `getconfig` (not found) | `temp` | `read` | `run` |
+|---|---|---|---|---|---|---|---|---|
+| `cmd` | always | always | always | always | always | always | always | always |
+| `version` | always | omitted | omitted | omitted | omitted | omitted | omitted | omitted |
+| `content` | omitted | present (path) | omitted | present (file bytes, possibly empty) | omitted | present (path) | present (file bytes) | present (output) |
+| `command` | omitted | omitted | omitted | omitted | omitted | omitted | omitted | present (echo) |
+| `code` | always `0` | always `0` | always `1` | always `0` | always `1` (no candidate) or `2` (IOError or foreign-UID per REQ-4800) | always `0` (in success; `2` on I/O failure upstream / generic error in v2) | always `0` (in success; open-failure shape in Section 5) | always (exit status) |
+| `error` | omitted | omitted | omitted | omitted | omitted | omitted | omitted | omitted |
 
 ## 4. `code` Value Semantics
 
 Upstream convention from `native_main.nim`:
 
 - `0` — success. The handler completed and any data it produced is in `content` (or, for `version`, in `version`).
-- `1` — recoverable failure. Used by upstream for "the operation cannot be performed but the system is fine." Concrete uses in scope: `getconfigpath` empty-result (no candidate exists). Outside v2 scope: `getconfig` empty config, `writerc` when file exists and `force` is false, `move` when destination exists and `overwrite` is false.
-- `2` — I/O failure. Used by upstream for "an underlying OS or file operation raised." Concrete uses in scope: `read` open-failure (file does not exist or cannot be opened). In upstream `temp` and `write` also use `code=2` on I/O failure; v2 returns the generic error response shape for `temp` I/O failures instead.
+- `1` — recoverable failure. Used by upstream for "the operation cannot be performed but the system is fine." Concrete uses in scope: `getconfigpath` empty-result (no candidate exists), `getconfig` no-candidate (no existing rc on disk; v2.2). Outside v2 scope: `writerc` when file exists and `force` is false, `move` when destination exists and `overwrite` is false.
+- `2` — I/O failure. Used by upstream for "an underlying OS or file operation raised." Concrete uses in scope: `read` open-failure (file does not exist or cannot be opened), `getconfig` IOError-on-read OR foreign-UID candidate (v2.2; the foreign-UID branch is v2.2-specific per REQ-4800 / Section 8.24.9 of the implementation plan). In upstream `temp` and `write` also use `code=2` on I/O failure; v2 returns the generic error response shape for `temp` I/O failures instead.
 
 V2 reproduces this code-numbering for the five in-scope handlers in their success and (for `read`) defined I/O-failure shapes. V2 does NOT introduce additional `code` values. Other failure modes (parse errors, whitelist rejections, oversized responses, missing required fields, TRAMP-path rejection) use the generic error response shape from Section 7, which has NO `code` field.
 
@@ -300,7 +369,7 @@ The v2 bridge claims the upstream-compatible VERSION string `"0.3.7"` in its `ve
 
 ### 8.1 Decision Rule
 
-v2 claims the LOWEST upstream `native_main.nim` `VERSION` whose request and response contract is fully implemented for the five handlers in scope, with the additional floor of `"0.1.9"` to satisfy any Tridactyl callsite that gates on `nativegate("0.1.9")`.
+v2 claims the LOWEST upstream `native_main.nim` `VERSION` whose request and response contract is fully implemented for the six handlers in scope, with the additional floor of `"0.1.9"` to satisfy any Tridactyl callsite that gates on `nativegate("0.1.9")`.
 
 ### 8.2 Audit of Per-cmd Contract Floors
 
@@ -330,7 +399,7 @@ Tridactyl's `nativegate(...)` will report v2 as compatible with all handlers up 
 | `Native.getenv` | `env` | `0.1.2` | Falls through. |
 | `:winFirefoxRestart` | `win_firefox_restart` | `0.1.6` | Falls through (Linux build of v2; Windows is out of scope). |
 | `ff_cmdline` (Linux non-Windows path) | `ppid` | `0.2.0` (implicit, since `ppid` was added before our visible history) | Falls through. Tridactyl falls back to its `0.2.0`-or-older code path that uses pyeval, which also falls through. The user-facing consequence is that Tridactyl cannot recover Firefox's command line, which is used only for profile discovery via the `:fixamo`-style code paths. Not on the editor flow path. |
-| `loadtheme` | `getconfig` | `0.1.0` | Falls through. Affects `:colors` excmd's runtime theme loading from the filesystem (themes set via `:colors built-in-name` continue to work). |
+| `Native.getrc` (loadtheme, `:source`, `TriStart -> source_quiet`) | `getconfig` | `0.1.0` | Implemented in v2.2 (Sections 3.2.7-3.2.11, B.8); ungated per REQ-4800 with file-UID equality check per Section 8.24.9 of the implementation plan. Adding the handler does NOT raise the claimed VERSION because `getconfig` predates `0.3.7` in upstream `native_messenger`. |
 
 These fall-throughs are by design (the corresponding handlers are out of v2 scope). The README documents the affected user-facing features in the Known Limitations section.
 
@@ -342,7 +411,7 @@ These fall-throughs are by design (the corresponding handlers are out of v2 scop
 
 ### 8.6 Forward-Compatibility Notes
 
-Future v2 releases that add new handlers (currently out of scope) MUST re-run this audit against the new combined contract. Any added handler whose upstream contract first appeared in a version higher than `0.3.7` would force the claimed VERSION upward to match. v2 deliberately avoids handler additions.
+Future v2 releases that add new handlers MUST re-run this audit against the new combined contract. Any added handler whose upstream contract first appeared in a version higher than `0.3.7` would force the claimed VERSION upward to match. v2.2 adds `getconfig` to the in-scope handler set; per Section 8.24.8 of the implementation plan, `getconfig` is present in upstream `native_main.nim` since native_messenger tag `0.0.1` (verified via `git show 0.0.1:src/native_main.nim`), so adding it does NOT raise the claimed VERSION above `0.3.7`. Subsequent handler additions remain deliberate scope decisions.
 
 ## 9. Tridactyl Wire-Usage Audit
 
@@ -529,7 +598,7 @@ Consequently, `editorcmd === "auto"` produces a cascade of "command not in white
 
 ### 14.4 `getconfigpath` Is Independent of the Editor Flow
 
-The fifth in-scope handler, `getconfigpath`, is NOT used by the editor flow. It supports the `:viewconfig --user` excmd, user-authored `:js`-based read-of-tridactylrc bindings, and (when paired with a `read`) the `:source` / `:loadtheme` flows. The `:source` and `:loadtheme` flows additionally require `getconfig` (not in v2 scope), so they remain broken; only `:viewconfig --user` is fully functional.
+The fifth in-scope handler `getconfigpath` and the sixth `getconfig` (added in v2.2) are NOT used by the editor flow. `getconfigpath` returns the path of the first existing rc candidate and is consumed by user-authored `:js`-based read-of-tridactylrc bindings and theme loading via `:colors` / `:js --rc`. `getconfig` returns the file contents of the same candidate and is consumed by Tridactyl's `:source` excmd and the `TriStart -> source_quiet` startup auto-source path. The `:viewconfig --user` excmd dumps in-memory `config.USERCONFIG` and does NOT consume `getconfigpath` (it is independent of the bridge).
 
 ## 15. Whitelist-Rejection Response Wording
 
@@ -1112,3 +1181,62 @@ The handler produced a response whose serialized JSON byte length (after structu
 ```
 
 This is a response-only fixture (it uses the response-fixture form per Appendix A.2 rather than the pair form). The triggering request is a frame whose declared length is within the inbound frame cap, but whose body is not parseable as a JSON object: malformed UTF-8 sequences, malformed JSON, and JSON values that are not objects (a JSON array, a JSON scalar) all reach this path. The harness's framed-request sender for this fixture transmits raw bytes prepared per the test, since the request side cannot be expressed within the fixture grammar's JSON-object request form. NOTE: a frame whose LENGTH PREFIX claims MORE bytes than the inbound frame cap allows produces NO response at all (silent close per Section 7.2); that scenario has no fixture because there is nothing to compare against.
+
+### B.8 `getconfig` Fixtures (v2.2)
+
+The fixtures below cover the five response shapes documented in Sections 3.2.7-3.2.11 and the implementation plan's Section 8.24.2-8.24.6.
+
+<!-- fixture: getconfig-success -->
+
+```json
+{
+  "request": { "cmd": "getconfig" },
+  "response": { "cmd": "getconfig", "content": { "$schema": "nonempty-string" }, "code": 0 }
+}
+```
+
+The returned `content` is the verbatim bytes of the first existing rc candidate (same walker as `getconfigpath` per Section 17), decoded as UTF-8.
+
+<!-- fixture: getconfig-empty -->
+
+```json
+{
+  "request": { "cmd": "getconfig" },
+  "response": { "cmd": "getconfig", "code": 1 }
+}
+```
+
+Note the ABSENCE of the `content` field. The candidate walker found no existing rc; the handler returns the upstream no-candidate shape (`code = 1`, no `content`). Per Section 6, structural absence is preserved on the wire and is structurally distinct from a present-empty-string `content` (see `getconfig-empty-rc-file` below).
+
+<!-- fixture: getconfig-empty-rc-file -->
+
+```json
+{
+  "request": { "cmd": "getconfig" },
+  "response": { "cmd": "getconfig", "content": "", "code": 0 }
+}
+```
+
+The candidate walker found an rc file that is exactly 0 bytes. The response carries an explicit empty-string `content` (PRESENT-AND-EMPTY); this shape is STRUCTURALLY DISTINCT from `getconfig-empty` above. Both `code` and `content` come straight from upstream's `readFile` semantics on a zero-byte file.
+
+<!-- fixture: getconfig-open-failure -->
+
+```json
+{
+  "request": { "cmd": "getconfig" },
+  "response": { "cmd": "getconfig", "code": 2 }
+}
+```
+
+The IOError shape. Upstream fires this when `fileExists` returned true but `readFile` then failed. v2.2 ALSO fires this when the candidate exists but its file-UID differs from the daemon's UID per REQ-4800 / Section 8.24.9 of the implementation plan. Distinct from `read`'s open-failure shape (which carries a present-empty `content` field; see Section 5) because `getconfig` follows upstream's `readFile`-raises path that never assigns `content`.
+
+<!-- fixture: getconfig-oversize -->
+
+```json
+{
+  "request": { "cmd": "getconfig" },
+  "response": { "cmd": "error", "error": "file too large to return" }
+}
+```
+
+The candidate rc file's raw byte size exceeds the outbound response cap. The bounded-read primitive returns the `:oversize` status; the handler maps it to the generic error shape with the same wording as the `read-file-too-large` fixture (Section 11 / B.7's `oversized-response-error` variant). v2-specific shape with no upstream equivalent.
