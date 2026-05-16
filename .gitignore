@@ -1,3 +1,4 @@
 .github
 plan
 reference
+*.elc
