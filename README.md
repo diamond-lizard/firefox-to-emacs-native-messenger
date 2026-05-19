@@ -102,7 +102,7 @@ This binds the Unix-domain socket at `~/.cache/firefox-to-emacs-native-messenger
 Before activating the Firefox manifest, confirm the bridge works end-to-end by sending a framed request through the wrapper script:
 
 ```sh
-printf '\x10\x00\x00\x00{"cmd":"version"}' | ~/bin/firefox-to-emacs-native-messenger-wrapper
+printf '\x11\x00\x00\x00{"cmd":"version"}' | ~/bin/firefox-to-emacs-native-messenger-wrapper
 ```
 
 You should see a framed JSON response on stdout containing the version string and `"code":0`.  If you do not, see [Section 10](#10-troubleshooting).
